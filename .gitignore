@@ -1,0 +1,6 @@
+.dart_tool/
+build/
+native/build/
+*.so
+*.o
+compile_commands.json
