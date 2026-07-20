@@ -1,7 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Joel Winarske
+# SPDX-License-Identifier: MIT
+
 name: ihs_webrtc_view
 description: >-
   Zero-copy WebRTC video as a Flutter platform view for ivi-homescreen. Native
-  presenter (dmabuf sink, §4.1 tier resolver, plane/subsurface/GPU-import
+  presenter (dmabuf sink, tier resolver, plane/subsurface/GPU-import
   tiers) plus the Flutter widget and track->sink-token binding glue. Data
   plane is native-to-native; Dart brokers the binding only.
 version: 0.1.0

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Joel Winarske
+SPDX-License-Identifier: MIT
+-->
+
 # ihs_webrtc_view
 
 The FFI plugin: a **native presenter** plus a **Flutter package**, delivering

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Joel Winarske
+# SPDX-License-Identifier: MIT
+
 # ihs_webrtc_view native presenter (.so).
 #
 # Speaks the flat C ABI only (third_party/lw_abi/lw_video_sink.h). MUST NOT

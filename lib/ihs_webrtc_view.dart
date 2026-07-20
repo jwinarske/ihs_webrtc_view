@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Joel Winarske
+// SPDX-License-Identifier: MIT
+
 /// ihs_webrtc_view — Flutter platform-view widget + track->sink-token glue.
 ///
 /// The Dart half brokers the binding only; frames never touch Dart. On view
