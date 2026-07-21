@@ -3,8 +3,14 @@
 
 # ihs_webrtc_view native presenter (.so).
 #
-# Speaks the flat C ABI only (third_party/lw_abi/lw_video_sink.h). MUST NOT
-# include any C++ libwebrtc header. Links drm-cxx + wayland + ihs_shared.
+# Speaks the flat C ABIs only: the producer side (third_party/lw_abi/
+# lw_video_sink.h) and the ivi-homescreen platform-view ABI (third_party/ihs).
+# MUST NOT include any C++ libwebrtc header.
+#
+# The heavy import (KMS plane / GL texture / SHM) is the registry's job: the
+# presenter negotiates a surface and forwards dmabuf frames via ihs_pv_submit,
+# so it links neither drm-cxx nor wayland. libihs_shared.so is resolved at run
+# time (dlsym/dlopen), never linked -- only its headers are used at build time.
 cmake_minimum_required(VERSION 3.16)
 project(ihs_webrtc_view_native LANGUAGES CXX)
 
@@ -13,18 +19,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
+find_package(Threads REQUIRED)
+
 add_library(ihs_webrtc_view SHARED
-  src/sink.cc             # LwVideoSinkV1 impl + SPSC handoff
-  src/tier_resolver.cc    # attach-time resolver (re-entrant)
-  src/tiers/plane.cc      # direct plane
-  src/tiers/subsurface.cc # subsurface promotion
-  src/tiers/gpu_import.cc # GPU-import floor
+  src/sink.cc           # Presenter: LwVideoSinkV1 consumer + ihs_pv producer
+  src/tier_resolver.cc  # ihs bridge + platform-view factory + negotiation
 )
 
 target_include_directories(ihs_webrtc_view
   PUBLIC  include
-  PRIVATE third_party/lw_abi          # C ABI only — no C++ libwebrtc headers
+  PRIVATE
+    third_party/lw_abi  # C ABI only — no C++ libwebrtc headers
+    third_party/ihs     # vendored ivi-homescreen platform-view headers
 )
 
-# TODO: find_package/link drm-cxx, wayland, ihs_shared.
-# target_link_libraries(ihs_webrtc_view PRIVATE drm-cxx wayland-client ihs_shared)
+# libihs_shared.so is dlopen'd, not linked; only libdl + pthreads are needed.
+target_link_libraries(ihs_webrtc_view PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
