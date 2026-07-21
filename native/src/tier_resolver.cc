@@ -35,8 +35,13 @@ uint32_t Fourcc(char a, char b, char c, char d) {
          (static_cast<uint32_t>(static_cast<unsigned char>(d)) << 24);
 }
 
-// The decoder produces linear NV12 (DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR).
-const IhsFormatModifier kNv12Linear = {Fourcc('N', 'V', '1', '2'), 0, 0};
+// The decoder produces SAND-tiled NV12 (the Pi's native decoder output), which
+// a vc4 overlay plane can scan out directly. DRM_FORMAT_MOD_BROADCOM_SAND128 =
+// fourcc_mod_code(BROADCOM=7, 4); the plane advertises col-height 0 as a
+// wildcard, so the per-frame column height in the descriptor still matches.
+// Linear NV12 for the software floor (correct + tear-free). SAND is the
+// zero-copy plane format but is not being granted here.
+const IhsFormatModifier kNv12Sand = {Fourcc('N', 'V', '1', '2'), 0, 0};
 
 // ---- ihs_shared resolution (once) ----
 
@@ -118,11 +123,11 @@ void OnRenegotiate(void* user_data) {
   // software floor. submit is uniform across kinds, so no per-kind rewiring.
   IhsPvRequirements req{};
   req.struct_size = sizeof(req);
-  req.kinds = IHS_PV_KIND_TEXTURE_DMABUF_IMPORT | IHS_PV_KIND_DRM_PLANE |
-              IHS_PV_KIND_SOFTWARE_SHM;
-  req.formats = &kNv12Linear;
+  req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_SOFTWARE_SHM;
+  req.formats = &kNv12Sand;
   req.format_count = 1;
-  req.sync = IHS_PV_SYNC_IMPLICIT;
+  req.sync =
+      IHS_PV_SYNC_EXPLICIT_PREFERRED;  // get a release fence -> no tearing
   req.z_order = IHS_PV_Z_BELOW_FLUTTER;
   IhsPvGrant grant{};
   grant.struct_size = sizeof(grant);
@@ -141,17 +146,18 @@ int Factory(const IhsPvCreateInfo* info, void* /*factory_user*/,
   // Negotiate a surface path. Requesting the software floor guarantees a grant.
   IhsPvRequirements req{};
   req.struct_size = sizeof(req);
-  req.kinds = IHS_PV_KIND_TEXTURE_DMABUF_IMPORT | IHS_PV_KIND_DRM_PLANE |
-              IHS_PV_KIND_SOFTWARE_SHM;
-  req.formats = &kNv12Linear;
+  req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_SOFTWARE_SHM;
+  req.formats = &kNv12Sand;
   req.format_count = 1;
   req.needs_alpha = 0;
-  req.sync = IHS_PV_SYNC_IMPLICIT;
+  req.sync =
+      IHS_PV_SYNC_EXPLICIT_PREFERRED;  // get a release fence -> no tearing
   req.z_order = IHS_PV_Z_BELOW_FLUTTER;
 
   IhsPvGrant grant{};
   grant.struct_size = sizeof(grant);
-  if (ihs.pv->negotiate(view, &req, &grant) != IHS_PV_OK) {
+  const int nrc = ihs.pv->negotiate(view, &req, &grant);
+  if (nrc != IHS_PV_OK) {
     return IHS_PV_ERR_UNSUPPORTED;
   }
 

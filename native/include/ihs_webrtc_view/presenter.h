@@ -78,6 +78,7 @@ class Presenter {
   void Submit(Held&& frame);  // build IhsFrame + ihs_pv_submit
   void Retire(Held& frame);   // wait release fence (bounded) + producer release
   void DrainInflight();       // retire everything still held
+  void ReleaseHeld(Held& h);  // drop a queued frame (re-QBUF its buffer)
 
   IhsBridge bridge_;
   ::IhsPlatformView* view_;
@@ -86,11 +87,23 @@ class Presenter {
 
   std::mutex m_;
   std::condition_variable cv_;
-  bool has_slot_ = false;  // a fresh frame is waiting in slot_
-  Held slot_{};            // latest-wins single-slot handoff
+  // Ready-to-present frames in arrival order, drained by the present thread on
+  // a playout clock (see PresentLoop). Bounded — an overrun drops the oldest so
+  // latency stays capped. Replaces the old single latest-wins slot; pacing
+  // needs a couple of frames of lookahead to smooth the decoder's bursty
+  // delivery.
+  std::deque<Held> ready_;
   bool stop_ = false;
   bool suspended_ = false;
   uint32_t generation_ = 0;  // pool generation of the current format
+
+  // Playout clock: maps the frames' RTP timestamps (even 90 kHz capture
+  // cadence) to wall-clock due times, so jittery decode delivery is presented
+  // on a steady beat. Anchored on the first frame (plus a small buffer) and
+  // re-anchored on a stream discontinuity / format change.
+  bool clock_set_ = false;
+  int64_t base_rtp_ = 0;      // RTP timestamp of the anchor frame (90 kHz)
+  int64_t base_wall_us_ = 0;  // wall-clock (monotonic us) the anchor is due
 
   std::deque<Held>
       inflight_;  // submitted, not yet retired (present thread only)

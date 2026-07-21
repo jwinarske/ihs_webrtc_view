@@ -8,8 +8,10 @@
 // only negotiates a slot's worth of buffering and forwards dmabuf frames.
 
 #include <poll.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -18,14 +20,34 @@
 namespace ihs_webrtc_view {
 namespace {
 
-// Presenter-held buffers cap. The decoder CAPTURE pool has headroom (>= 6); we
-// keep at most this many submitted-but-not-retired so the decoder never
-// starves.
-constexpr size_t kMaxInflight = 3;
+// Presenter-held buffers cap. The decoder CAPTURE pool has headroom (>= 16); we
+// keep at most this many submitted-but-not-retired so a buffer is not re-queued
+// to the decoder until the implicit-sync scanout path (scene overlay) has long
+// finished with it — a wide margin against the decoder overwriting a buffer the
+// KMS plane is still scanning (tearing). Must stay below the CAPTURE count so
+// the decoder never starves for a free buffer to decode into.
+constexpr size_t kMaxInflight = 8;
 
 // Bounded wait for a release fence before force-retiring a buffer (~2 vsync at
 // 60 Hz + margin), matching the sink contract's release watchdog.
 constexpr int kReleaseFenceTimeoutMs = 40;
+
+// Playout pacing (see PresentLoop). RTP video is a 90 kHz clock.
+constexpr int64_t kRtpHz = 90000;
+// Lead the anchor by this much so early-arriving frames can be held rather than
+// rushed — absorbs the decoder's bursty delivery. ~1.5 frames at 30 fps.
+constexpr int64_t kPlayoutBufferUs = 50000;
+// Ready-queue depth cap; an overrun drops the oldest to keep latency bounded.
+constexpr size_t kMaxReady = 6;
+// An RTP gap beyond this (vs the playout clock) is a discontinuity (freeze,
+// seek, format change) — re-anchor rather than stall or dump the whole queue.
+constexpr int64_t kResyncThresholdUs = 300000;
+
+int64_t NowUs() {
+  timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
+}
 
 void WaitAndCloseFence(int fd) {
   if (fd < 0) {
@@ -82,13 +104,14 @@ int Presenter::OnFrame(const LwDmabufDescriptor* desc, LwFrameRelease release,
     if (self->suspended_ || self->stop_) {
       return 0;  // decline; producer drops (keeps the decoder unblocked)
     }
-    if (self->has_slot_) {
-      // Latest-wins: the previous slotted-but-unpresented frame is dropped.
-      dropped = self->slot_;
+    // Enqueue for the paced present thread. Overrun (the consumer fell behind)
+    // drops the oldest so latency stays bounded — the newest motion wins.
+    self->ready_.push_back(Held{*desc, release, release_ctx, -1});
+    if (self->ready_.size() > kMaxReady) {
+      dropped = self->ready_.front();
       have_dropped = true;
+      self->ready_.pop_front();
     }
-    self->slot_ = Held{*desc, release, release_ctx, -1};
-    self->has_slot_ = true;
   }
   self->cv_.notify_one();
   if (have_dropped && dropped.release) {
@@ -108,13 +131,25 @@ void Presenter::OnEos(void* user) {
   auto* self = static_cast<Presenter*>(user);
   {
     std::lock_guard<std::mutex> lock(self->m_);
-    // Drop any pending slot; the present thread drains in-flight on wake.
-    if (self->has_slot_ && self->slot_.release) {
-      self->slot_.release(self->slot_.release_ctx);
+    // Drop any queued-but-unpresented frames; the present thread drains
+    // in-flight on wake. Re-anchor the clock so a post-EOS resume restarts
+    // cleanly rather than treating the gap as one giant late interval.
+    for (auto& h : self->ready_) {
+      if (h.release) {
+        h.release(h.release_ctx);
+      }
     }
-    self->has_slot_ = false;
+    self->ready_.clear();
+    self->clock_set_ = false;
   }
   self->cv_.notify_one();
+}
+
+void Presenter::ReleaseHeld(Held& h) {
+  if (h.release) {
+    h.release(h.release_ctx);
+    h.release = nullptr;
+  }
 }
 
 // ---- present thread ----
@@ -124,38 +159,81 @@ void Presenter::PresentLoop() {
     Held frame{};
     {
       std::unique_lock<std::mutex> lock(m_);
-      cv_.wait(lock, [this] { return has_slot_ || stop_; });
-      if (stop_) {
-        // Retire a frame still parked in the slot so its buffer is re-queued.
-        if (has_slot_) {
-          Held s = slot_;
-          has_slot_ = false;
+      // Wait until a frame is ready (or shutdown). Once ready, hold it until
+      // its playout due time; a spurious/early wake or a newly-arrived frame
+      // just re-evaluates the head.
+      for (;;) {
+        cv_.wait(lock, [this] { return !ready_.empty() || stop_; });
+        if (stop_) {
+          for (auto& h : ready_) {
+            ReleaseHeld(h);
+          }
+          ready_.clear();
           lock.unlock();
-          if (s.release) {
-            s.release(s.release_ctx);
+          DrainInflight();
+          return;
+        }
+
+        const int64_t rtp = ready_.front().desc.rtp_timestamp_us;
+        const int64_t now = NowUs();
+        if (!clock_set_) {
+          base_rtp_ = rtp;
+          base_wall_us_ = now + kPlayoutBufferUs;
+          clock_set_ = true;
+        }
+        int64_t due = base_wall_us_ + (rtp - base_rtp_) * 1000000 / kRtpHz;
+
+        // Discontinuity (freeze/seek/format wrap): the head sits far off the
+        // clock in either direction. Re-anchor on it instead of stalling for a
+        // huge future gap or dumping a long-past backlog frame-by-frame.
+        if (due - now > kResyncThresholdUs || now - due > kResyncThresholdUs) {
+          base_rtp_ = rtp;
+          base_wall_us_ = now + kPlayoutBufferUs;
+          due = base_wall_us_;
+        }
+
+        if (now < due) {
+          // Not yet time. Sleep until due, but wake on a new frame/stop.
+          cv_.wait_for(lock, std::chrono::microseconds(due - now));
+          continue;  // re-evaluate the head (it may have changed)
+        }
+
+        // Due. If a newer frame is already due too, this one is stale — drop it
+        // and catch up rather than flashing both in one refresh interval.
+        if (ready_.size() > 1) {
+          const int64_t next_rtp = ready_[1].desc.rtp_timestamp_us;
+          const int64_t next_due =
+              base_wall_us_ + (next_rtp - base_rtp_) * 1000000 / kRtpHz;
+          if (now >= next_due) {
+            Held stale = ready_.front();
+            ready_.pop_front();
+            lock.unlock();
+            ReleaseHeld(stale);
+            break;  // fall through to retire pass, then loop
           }
         }
+
+        frame = ready_.front();
+        ready_.pop_front();
         break;
       }
-      frame = slot_;
-      has_slot_ = false;
     }
 
-    // A pool reallocation reuses fd numbers; retire every prior-generation
-    // buffer before presenting the new generation.
-    if (frame.desc.pool_generation != generation_) {
-      DrainInflight();
-      generation_ = frame.desc.pool_generation;
+    if (frame.release != nullptr) {
+      // A pool reallocation reuses fd numbers; retire every prior-generation
+      // buffer before presenting the new generation.
+      if (frame.desc.pool_generation != generation_) {
+        DrainInflight();
+        generation_ = frame.desc.pool_generation;
+      }
+      Submit(std::move(frame));
     }
-
-    Submit(std::move(frame));
 
     while (inflight_.size() > kMaxInflight) {
       Retire(inflight_.front());
       inflight_.pop_front();
     }
   }
-  DrainInflight();
 }
 
 void Presenter::Submit(Held&& frame) {
