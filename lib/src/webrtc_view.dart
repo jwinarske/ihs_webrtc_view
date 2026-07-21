@@ -61,14 +61,21 @@ class _WebRtcViewState extends State<WebRtcView>
   Widget build(BuildContext context) {
     return PlatformViewLink(
       viewType: kWebRtcViewType,
-      surfaceFactory: (context, controller) => AnimatedBuilder(
-        animation: _repaint,
-        builder: (_, __) => PlatformViewSurface(
+      surfaceFactory: (context, controller) {
+        // Build the surface once and hand it to AnimatedBuilder as `child`, so
+        // the ticker still schedules a frame each vsync (re-compositing the view
+        // with the newest decoded frame) without reconstructing the widget.
+        final surface = PlatformViewSurface(
           controller: controller,
           hitTestBehavior: widget.hitTestBehavior,
           gestureRecognizers: widget.gestureRecognizers,
-        ),
-      ),
+        );
+        return AnimatedBuilder(
+          animation: _repaint,
+          child: surface,
+          builder: (_, child) => child!,
+        );
+      },
       onCreatePlatformView: (params) {
         final controller = _WebRtcViewController(
           viewId: params.id,

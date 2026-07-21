@@ -32,14 +32,10 @@ constexpr size_t kMaxInflight = 8;
 // 60 Hz + margin), matching the sink contract's release watchdog.
 constexpr int kReleaseFenceTimeoutMs = 40;
 
-// Playout pacing (see PresentLoop). RTP video is a 90 kHz clock.
-constexpr int64_t kRtpHz = 90000;
 // Lead the anchor by this much so early-arriving frames can be held rather than
 // rushed — absorbs the decoder's bursty delivery. ~1.5 frames at 30 fps.
 constexpr int64_t kPlayoutBufferUs = 50000;
-// Ready-queue depth cap; an overrun drops the oldest to keep latency bounded.
-constexpr size_t kMaxReady = 6;
-// An RTP gap beyond this (vs the playout clock) is a discontinuity (freeze,
+// A pts gap beyond this (vs the playout clock) is a discontinuity (freeze,
 // seek, format change) — re-anchor rather than stall or dump the whole queue.
 constexpr int64_t kResyncThresholdUs = 300000;
 
@@ -104,14 +100,17 @@ int Presenter::OnFrame(const LwDmabufDescriptor* desc, LwFrameRelease release,
     if (self->suspended_ || self->stop_) {
       return 0;  // decline; producer drops (keeps the decoder unblocked)
     }
-    // Enqueue for the paced present thread. Overrun (the consumer fell behind)
-    // drops the oldest so latency stays bounded — the newest motion wins.
-    self->ready_.push_back(Held{*desc, release, release_ctx, -1});
-    if (self->ready_.size() > kMaxReady) {
-      dropped = self->ready_.front();
+    // Enqueue for the paced present thread (fixed ring, allocation-free).
+    // Overrun (the consumer fell behind) drops the oldest so latency stays
+    // bounded — the newest motion wins.
+    if (self->ready_count_ == Presenter::kReadyCap) {
+      dropped = self->ready_at(0);
       have_dropped = true;
-      self->ready_.pop_front();
+      self->ready_pop();
     }
+    self->ready_[(self->ready_head_ + self->ready_count_) %
+                 Presenter::kReadyCap] = Held{*desc, release, release_ctx, -1};
+    ++self->ready_count_;
   }
   self->cv_.notify_one();
   if (have_dropped && dropped.release) {
@@ -129,18 +128,24 @@ void Presenter::OnFormat(const LwDmabufDescriptor* /*fmt_only*/,
 
 void Presenter::OnEos(void* user) {
   auto* self = static_cast<Presenter*>(user);
+  // Drop any queued-but-unpresented frames; the present thread drains in-flight
+  // on wake. Move them out under the lock, then release outside it — the
+  // producer's release() must not run while m_ is held. Re-anchor the clock so
+  // a post-EOS resume restarts cleanly rather than as one giant late interval.
+  Held pending[Presenter::kReadyCap];
+  size_t n = 0;
   {
     std::lock_guard<std::mutex> lock(self->m_);
-    // Drop any queued-but-unpresented frames; the present thread drains
-    // in-flight on wake. Re-anchor the clock so a post-EOS resume restarts
-    // cleanly rather than treating the gap as one giant late interval.
-    for (auto& h : self->ready_) {
-      if (h.release) {
-        h.release(h.release_ctx);
-      }
+    while (!self->ready_empty()) {
+      pending[n++] = self->ready_at(0);
+      self->ready_pop();
     }
-    self->ready_.clear();
     self->clock_set_ = false;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (pending[i].release) {
+      pending[i].release(pending[i].release_ctx);
+    }
   }
   self->cv_.notify_one();
 }
@@ -163,31 +168,38 @@ void Presenter::PresentLoop() {
       // its playout due time; a spurious/early wake or a newly-arrived frame
       // just re-evaluates the head.
       for (;;) {
-        cv_.wait(lock, [this] { return !ready_.empty() || stop_; });
+        cv_.wait(lock, [this] { return !ready_empty() || stop_; });
         if (stop_) {
-          for (auto& h : ready_) {
-            ReleaseHeld(h);
+          // Move queued frames out, then release outside the lock (release()
+          // must not run while m_ is held).
+          Held pending[kReadyCap];
+          size_t n = 0;
+          while (!ready_empty()) {
+            pending[n++] = ready_at(0);
+            ready_pop();
           }
-          ready_.clear();
           lock.unlock();
+          for (size_t i = 0; i < n; ++i) {
+            ReleaseHeld(pending[i]);
+          }
           DrainInflight();
           return;
         }
 
-        const int64_t rtp = ready_.front().desc.rtp_timestamp_us;
+        const int64_t pts = ready_at(0).desc.rtp_timestamp_us;  // microseconds
         const int64_t now = NowUs();
         if (!clock_set_) {
-          base_rtp_ = rtp;
+          base_pts_us_ = pts;
           base_wall_us_ = now + kPlayoutBufferUs;
           clock_set_ = true;
         }
-        int64_t due = base_wall_us_ + (rtp - base_rtp_) * 1000000 / kRtpHz;
+        int64_t due = base_wall_us_ + (pts - base_pts_us_);
 
         // Discontinuity (freeze/seek/format wrap): the head sits far off the
         // clock in either direction. Re-anchor on it instead of stalling for a
         // huge future gap or dumping a long-past backlog frame-by-frame.
         if (due - now > kResyncThresholdUs || now - due > kResyncThresholdUs) {
-          base_rtp_ = rtp;
+          base_pts_us_ = pts;
           base_wall_us_ = now + kPlayoutBufferUs;
           due = base_wall_us_;
         }
@@ -200,21 +212,20 @@ void Presenter::PresentLoop() {
 
         // Due. If a newer frame is already due too, this one is stale — drop it
         // and catch up rather than flashing both in one refresh interval.
-        if (ready_.size() > 1) {
-          const int64_t next_rtp = ready_[1].desc.rtp_timestamp_us;
-          const int64_t next_due =
-              base_wall_us_ + (next_rtp - base_rtp_) * 1000000 / kRtpHz;
+        if (ready_count_ > 1) {
+          const int64_t next_pts = ready_at(1).desc.rtp_timestamp_us;
+          const int64_t next_due = base_wall_us_ + (next_pts - base_pts_us_);
           if (now >= next_due) {
-            Held stale = ready_.front();
-            ready_.pop_front();
+            Held stale = ready_at(0);
+            ready_pop();
             lock.unlock();
             ReleaseHeld(stale);
             break;  // fall through to retire pass, then loop
           }
         }
 
-        frame = ready_.front();
-        ready_.pop_front();
+        frame = ready_at(0);
+        ready_pop();
         break;
       }
     }
