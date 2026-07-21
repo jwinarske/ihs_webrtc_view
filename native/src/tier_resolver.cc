@@ -35,13 +35,12 @@ uint32_t Fourcc(char a, char b, char c, char d) {
          (static_cast<uint32_t>(static_cast<unsigned char>(d)) << 24);
 }
 
-// The decoder produces SAND-tiled NV12 (the Pi's native decoder output), which
-// a vc4 overlay plane can scan out directly. DRM_FORMAT_MOD_BROADCOM_SAND128 =
-// fourcc_mod_code(BROADCOM=7, 4); the plane advertises col-height 0 as a
-// wildcard, so the per-frame column height in the descriptor still matches.
-// Linear NV12 for the software floor (correct + tear-free). SAND is the
-// zero-copy plane format but is not being granted here.
-const IhsFormatModifier kNv12Sand = {Fourcc('N', 'V', '1', '2'), 0, 0};
+// The format we request: linear NV12 (DRM_FORMAT_MOD_LINEAR == 0). The decoder
+// emits linear NV12, which a vc4 overlay plane scans out directly and the
+// software floor reads correctly. (The Pi's native decoder can also produce
+// SAND-tiled NV12 via DRM_FORMAT_MOD_BROADCOM_SAND128; that path is not used
+// here, so the modifier is left linear to match what is actually produced.)
+const IhsFormatModifier kNv12Linear = {Fourcc('N', 'V', '1', '2'), 0, 0};
 
 // ---- ihs_shared resolution (once) ----
 
@@ -124,7 +123,7 @@ void OnRenegotiate(void* user_data) {
   IhsPvRequirements req{};
   req.struct_size = sizeof(req);
   req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_SOFTWARE_SHM;
-  req.formats = &kNv12Sand;
+  req.formats = &kNv12Linear;
   req.format_count = 1;
   req.sync =
       IHS_PV_SYNC_EXPLICIT_PREFERRED;  // get a release fence -> no tearing
@@ -147,7 +146,7 @@ int Factory(const IhsPvCreateInfo* info, void* /*factory_user*/,
   IhsPvRequirements req{};
   req.struct_size = sizeof(req);
   req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_SOFTWARE_SHM;
-  req.formats = &kNv12Sand;
+  req.formats = &kNv12Linear;
   req.format_count = 1;
   req.needs_alpha = 0;
   req.sync =

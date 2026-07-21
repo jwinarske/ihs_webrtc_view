@@ -88,21 +88,31 @@ class Presenter {
   std::mutex m_;
   std::condition_variable cv_;
   // Ready-to-present frames in arrival order, drained by the present thread on
-  // a playout clock (see PresentLoop). Bounded — an overrun drops the oldest so
-  // latency stays capped. Replaces the old single latest-wins slot; pacing
-  // needs a couple of frames of lookahead to smooth the decoder's bursty
-  // delivery.
-  std::deque<Held> ready_;
+  // a playout clock (see PresentLoop). A fixed-capacity ring: on_frame runs on
+  // the decoder thread, which the sink contract requires to be allocation-free,
+  // and an overrun drops the oldest so latency stays capped. A couple of frames
+  // of lookahead smooth the decoder's bursty delivery.
+  static constexpr size_t kReadyCap = 6;
+  Held ready_[kReadyCap]{};
+  size_t ready_head_ = 0;   // index of the oldest live entry
+  size_t ready_count_ = 0;  // live entries in the ring
+  // Ring accessors; the caller holds m_.
+  bool ready_empty() const { return ready_count_ == 0; }
+  Held& ready_at(size_t i) { return ready_[(ready_head_ + i) % kReadyCap]; }
+  void ready_pop() {
+    ready_head_ = (ready_head_ + 1) % kReadyCap;
+    --ready_count_;
+  }
   bool stop_ = false;
   bool suspended_ = false;
   uint32_t generation_ = 0;  // pool generation of the current format
 
-  // Playout clock: maps the frames' RTP timestamps (even 90 kHz capture
+  // Playout clock: maps the frames' presentation timestamps (the even capture
   // cadence) to wall-clock due times, so jittery decode delivery is presented
   // on a steady beat. Anchored on the first frame (plus a small buffer) and
   // re-anchored on a stream discontinuity / format change.
   bool clock_set_ = false;
-  int64_t base_rtp_ = 0;      // RTP timestamp of the anchor frame (90 kHz)
+  int64_t base_pts_us_ = 0;   // presentation timestamp (us) of the anchor frame
   int64_t base_wall_us_ = 0;  // wall-clock (monotonic us) the anchor is due
 
   std::deque<Held>
