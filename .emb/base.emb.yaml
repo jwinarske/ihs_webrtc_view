@@ -14,16 +14,17 @@
 # `base.emb.yaml` is the reserved base filename and is never itself a target.
 #
 # The buildable artifact is the native presenter shared library
-# (native/CMakeLists.txt): the LwVideoSinkV1 dmabuf sink + attach-time tier
-# resolver. Presentation tiers (direct plane / subsurface / GPU import) are
-# resolved at run time, not selected at build time, so there is a single
-# backend. Links drm-cxx (augment) + wayland (sysroot) at build time.
+# (native/CMakeLists.txt): an LwVideoSinkV1 dmabuf sink that forwards each
+# decoded frame to the ivi-homescreen platform-view registry via ihs_pv_submit.
+# The registry owns the import (DRM plane / dmabuf texture / software floor), so
+# the presenter links neither drm-cxx nor wayland — only libdl + pthreads. There
+# is a single backend; the surface path is negotiated at run time.
 #
 # ihs_shared is NOT a build/link dependency: it is a hard C ABI (ihs_* only,
 # per libihs_shared.so's version script), so the presenter uses only its
-# headers at build time and dlopen/dlsym's libihs_shared.so — already present
-# on the target from the ivi-homescreen install — at run time. Speaks the flat
-# C ABI only.
+# vendored headers (native/third_party/ihs) at build time and dlsym/dlopen's
+# libihs_shared.so — already present on the target from the ivi-homescreen
+# install — at run time. Speaks the flat C ABIs only (ihs/* + lw_video_sink.h).
 id: ihs_webrtc_view
 type: app
 supported_archs: [arm64, x86_64]

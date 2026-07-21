@@ -5,22 +5,20 @@
 #
 # Hardware/OS facts (toolchain, sysroot image, partition, cpu tuning, base
 # DRM/EGL/GBM/Wayland/Vulkan stack) come from emb's shipped board library
-# (boards/raspberry-pi.emb.yaml); each target `extends` a board and overlays the
-# presenter's source deps (drm-cxx, ihs_shared) and any extra packages.
+# (boards/raspberry-pi.emb.yaml); each target extends a board. The presenter has
+# no source deps to overlay — it links only libdl + pthreads from the sysroot.
 #
 #   emb cross . --target rpi4-trixie --build
 #
-# trixie is used (matching drm-cxx) so the display stack ships libdisplay-info
-# >= 0.2.0. The Pi 4 has a stateful V4L2 H.264 decoder (bcm2835-codec); the
-# Pi 5 has none, so on rpi5 the plane tier still works but frames only flow
-# once a decoder is present (software fallback lives in libwebrtc, not here).
+# The Pi 4 has a stateful V4L2 H.264 decoder (bcm2835-codec); the Pi 5 has none,
+# so on rpi5 frames only flow once a decoder is present (the software fallback
+# lives in libwebrtc, not here).
 #
-# ihs_shared is consumed as a hard C ABI: the presenter uses only its headers
-# at build time and dlopen/dlsym's libihs_shared.so (shipped on the target by
-# ivi-homescreen) at run time, so it is neither an augment nor a sysroot dep.
-#
-# STATUS: scaffold. native/CMakeLists.txt still needs its real sources and the
-# drm-cxx + wayland link before this links.
+# ihs_shared is consumed as a hard C ABI: the presenter uses only its vendored
+# headers (native/third_party/ihs) at build time and dlsym/dlopen's
+# libihs_shared.so (shipped on the target by ivi-homescreen) at run time, so it
+# is neither an augment nor a sysroot dep. Likewise the platform-view registry
+# owns the KMS/EGL import, so there is no drm-cxx or wayland link.
 id: ihs_webrtc_view
 type: app
 supported_archs: [arm64]
@@ -44,28 +42,15 @@ cross:
     install_dir: /usr/lib/aarch64-linux-gnu
 
   targets:
+    # The presenter has no augment libraries: it links only libdl + pthreads
+    # from the sysroot and forwards frames to the registry via ihs_pv_submit.
     # -- Raspberry Pi 5 (Cortex-A76) --------------------------------------
     rpi5-trixie:
       extends: rpi5-trixie
-      augment: &augment_libs
-        # drm-cxx: the atomic-KMS / plane + dmabuf scanout library the plane
-        # tier drives. Built from source (not in apt), static + PIC so it links
-        # into the presenter .so with no extra object to deploy.
-        - pkg: drm-cxx
-          min: "0"
-          url: https://github.com/jwinarske/drm-cxx/archive/refs/heads/main.tar.gz
-          build: cmake
-          static: true
-          defines:
-            DRM_CXX_BUILD_EXAMPLES: 'OFF'
-            DRM_CXX_BUILD_TESTS: 'OFF'
-            DRM_CXX_BUILD_BENCHMARKS: 'OFF'
-            CMAKE_POSITION_INDEPENDENT_CODE: 'ON'
       backends: &backends_presenter
         presenter: {}
 
     # -- Raspberry Pi 4 (Cortex-A72) — has the bcm2835-codec V4L2 decoder --
     rpi4-trixie:
       extends: rpi4-trixie
-      augment: *augment_libs
       backends: *backends_presenter
