@@ -7,3 +7,6 @@ native/build/
 *.so
 *.o
 compile_commands.json
+
+# Dart package lockfile (library — resolved by consumers)
+pubspec.lock
