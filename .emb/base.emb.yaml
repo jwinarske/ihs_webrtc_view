@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2026 Joel Winarske
+# SPDX-License-Identifier: MIT
+
+# Shared base for the ihs_webrtc_view native-presenter cross-builds in this
+# .emb/ directory.
+#
+# emb (emb_cli) auto-discovers `.emb/` when you run `emb cross` from the repo
+# root and deep-merges each <board>.emb.yaml over this base. Build from the
+# repo root; the CMake source is the presenter under native/ (build.app_path):
+#
+#   emb cross . --list-targets
+#   emb cross . --target rpi4-trixie --build
+#
+# `base.emb.yaml` is the reserved base filename and is never itself a target.
+#
+# The buildable artifact is the native presenter shared library
+# (native/CMakeLists.txt): the LwVideoSinkV1 dmabuf sink + attach-time tier
+# resolver. Presentation tiers (direct plane / subsurface / GPU import) are
+# resolved at run time, not selected at build time, so there is a single
+# backend. Links drm-cxx (augment) + wayland (sysroot) at build time.
+#
+# ihs_shared is NOT a build/link dependency: it is a hard C ABI (ihs_* only,
+# per libihs_shared.so's version script), so the presenter uses only its
+# headers at build time and dlopen/dlsym's libihs_shared.so — already present
+# on the target from the ivi-homescreen install — at run time. Speaks the flat
+# C ABI only.
+id: ihs_webrtc_view
+type: app
+supported_archs: [arm64, x86_64]
+supported_host_types: [fedora, ubuntu]
+
+cross:
+  # `provider` is required only to parse this block; every board target
+  # overrides it with its own provider.
+  provider: arm-gnu
+  # One CMake build of the presenter .so. (native/CMakeLists.txt has no build
+  # options yet; add toggles here as they land — e.g. a demo/example switch.)
+  backends:
+    presenter: {}
