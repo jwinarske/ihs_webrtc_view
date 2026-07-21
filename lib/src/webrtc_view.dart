@@ -39,15 +39,35 @@ class WebRtcView extends StatefulWidget {
   State<WebRtcView> createState() => _WebRtcViewState();
 }
 
-class _WebRtcViewState extends State<WebRtcView> {
+class _WebRtcViewState extends State<WebRtcView>
+    with SingleTickerProviderStateMixin {
+  // The registry updates the view's imported texture per ihs_pv_submit, but a
+  // composited (hybrid) platform view is only re-drawn when Flutter produces a
+  // frame. A retained-mode UI goes idle after mount, freezing the video on its
+  // first frame. An always-running ticker keeps a frame scheduled every vsync
+  // so the view re-composites with the newest decoded frame.
+  late final AnimationController _repaint = AnimationController(
+    vsync: this,
+    duration: const Duration(seconds: 1),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _repaint.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return PlatformViewLink(
       viewType: kWebRtcViewType,
-      surfaceFactory: (context, controller) => PlatformViewSurface(
-        controller: controller,
-        hitTestBehavior: widget.hitTestBehavior,
-        gestureRecognizers: widget.gestureRecognizers,
+      surfaceFactory: (context, controller) => AnimatedBuilder(
+        animation: _repaint,
+        builder: (_, __) => PlatformViewSurface(
+          controller: controller,
+          hitTestBehavior: widget.hitTestBehavior,
+          gestureRecognizers: widget.gestureRecognizers,
+        ),
       ),
       onCreatePlatformView: (params) {
         final controller = _WebRtcViewController(
