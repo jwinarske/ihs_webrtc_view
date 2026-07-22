@@ -35,3 +35,14 @@ target_include_directories(ihs_webrtc_view
 
 # libihs_shared.so is dlopen'd, not linked; only libdl + pthreads are needed.
 target_link_libraries(ihs_webrtc_view PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+
+# Presenter check against a stand-in registry: the test binary exports
+# ihs_get_api itself, so every call the presenter makes lands on a recording
+# implementation. Needs -rdynamic so that dlsym(RTLD_DEFAULT, ...) finds it.
+# No GPU, display or webrtc required.
+enable_testing()
+add_executable(presenter_test test/presenter_test.cc)
+target_link_libraries(presenter_test PRIVATE ihs_webrtc_view Threads::Threads)
+target_include_directories(presenter_test PRIVATE third_party/ihs third_party/lw_abi)
+set_target_properties(presenter_test PROPERTIES ENABLE_EXPORTS ON)
+add_test(NAME presenter_test COMMAND presenter_test)
