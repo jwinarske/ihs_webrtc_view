@@ -7,4 +7,5 @@
 cmake_minimum_required(VERSION 3.16)
 project(ihs_webrtc_view_root LANGUAGES CXX)
 
+enable_testing()
 add_subdirectory(native)

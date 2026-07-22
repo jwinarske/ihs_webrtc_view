@@ -77,6 +77,7 @@ class Presenter {
   void PresentLoop();         // present thread body
   void Submit(Held&& frame);  // build IhsFrame + ihs_pv_submit
   void Retire(Held& frame);   // wait release fence (bounded) + producer release
+  void RetireSignalled();     // retire whatever the compositor has released
   void DrainInflight();       // retire everything still held
   void ReleaseHeld(Held& h);  // drop a queued frame (re-QBUF its buffer)
 

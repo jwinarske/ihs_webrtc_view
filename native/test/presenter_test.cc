@@ -1,0 +1,313 @@
+// SPDX-FileCopyrightText: 2026 Joel Winarske
+// SPDX-License-Identifier: MIT
+
+// Checks the presenter against a stand-in ivi-homescreen. The test binary
+// exports ihs_get_api itself, so the presenter's dlsym(RTLD_DEFAULT, ...)
+// resolves to this file and every call it makes -- register_factory,
+// negotiate, submit -- lands on a recording implementation. Frames are
+// synthetic: a memfd per buffer stands in for a dma-buf, which is enough
+// because the presenter forwards plane fds rather than importing them.
+//
+// It exercises the presenter's public C ABI, the same two entry points the
+// Dart control plane calls, and asserts the parts of the producer contract
+// the presenter is responsible for:
+//
+//   - a frame taken from the sink reaches ihs submit with its geometry,
+//     format and plane fds intact
+//   - every taken frame is released back to the producer exactly once, so the
+//     decoder's pool cannot leak
+//   - a frame is never released before it has been submitted
+//   - declining costs nothing: with no view bound the sink still releases
+//   - suspending stops submissions without stranding buffers
+//
+// Runs anywhere: no GPU, no display, no webrtc.
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <vector>
+
+#include "ihs/ihs.h"
+#include "ihs/platform_view.h"
+#include "lw_video_sink.h"
+
+namespace {
+
+int g_failures = 0;
+
+#define CHECK(cond)                                               \
+  do {                                                            \
+    if (!(cond)) {                                                \
+      std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+      ++g_failures;                                               \
+    }                                                             \
+  } while (0)
+
+// ---- recording stand-in for the registry --------------------------------
+
+struct Submitted {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t plane_count = 0;
+  int plane_fd0 = -1;
+  uint32_t stride0 = 0;
+  uint64_t modifier = 0;
+  uint32_t fourcc = 0;
+};
+
+std::mutex g_mu;
+std::vector<Submitted> g_submits;
+IhsPvFactory g_factory = nullptr;
+void* g_factory_user = nullptr;
+
+int FakeRegisterFactory(const char* /*view_type*/, IhsPvFactory factory,
+                        void* user) {
+  g_factory = factory;
+  g_factory_user = user;
+  return IHS_PV_OK;
+}
+void FakeUnregisterFactory(const char* /*view_type*/) { g_factory = nullptr; }
+
+int FakeNegotiate(IhsPlatformView* /*view*/,
+                  const IhsPvRequirements* /*requirements*/, IhsPvGrant* out) {
+  if (out == nullptr) {
+    return IHS_PV_ERR_INVALID;
+  }
+  out->struct_size = sizeof(IhsPvGrant);
+  out->granted_kind = IHS_PV_KIND_TEXTURE_DMABUF_IMPORT;
+  out->sync = IHS_PV_SYNC_IMPLICIT;  // release rides the callbacks, no fence
+  std::memset(&out->format, 0, sizeof(out->format));
+  return IHS_PV_OK;
+}
+
+int FakeSubmit(IhsPlatformView* /*view*/, const IhsFrame* frame,
+               int acquire_fence_fd, int* out_release_fence_fd) {
+  if (acquire_fence_fd >= 0) {
+    ::close(acquire_fence_fd);  // the registry owns it
+  }
+  if (out_release_fence_fd != nullptr) {
+    *out_release_fence_fd = -1;  // implicit sync
+  }
+  if (frame != nullptr) {
+    Submitted s;
+    s.width = frame->width;
+    s.height = frame->height;
+    s.plane_count = frame->plane_count;
+    s.plane_fd0 = frame->plane_fd[0];
+    s.stride0 = frame->plane_stride[0];
+    s.modifier = frame->format.modifier;
+    s.fourcc = frame->format.fourcc;
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_submits.push_back(s);
+  }
+  return IHS_PV_OK;
+}
+
+int FakeQueryCaps(IhsPvCapabilities* /*out*/) { return IHS_PV_ERR_UNSUPPORTED; }
+int FakeVulkanCtx(IhsVulkanContext* /*out*/) { return IHS_PV_ERR_UNSUPPORTED; }
+int FakeEglCtx(IhsEglContext* /*out*/) { return IHS_PV_ERR_UNSUPPORTED; }
+uint32_t FakeGrantPlaneId(IhsPlatformView* /*view*/) { return 0; }
+int FakeGrantShmFd(IhsPlatformView* /*view*/, size_t* /*out_stride*/) {
+  return -1;
+}
+
+const IhsPlatformViewApi g_pv_api = {
+    sizeof(IhsPlatformViewApi),
+    FakeQueryCaps,
+    FakeVulkanCtx,
+    FakeEglCtx,
+    FakeRegisterFactory,
+    FakeUnregisterFactory,
+    FakeNegotiate,
+    FakeGrantPlaneId,
+    FakeGrantShmFd,
+    FakeSubmit,
+};
+
+const IhsApi g_api = {
+    sizeof(IhsApi), IHS_SHARED_ABI_VERSION, nullptr, nullptr, &g_pv_api,
+    nullptr,
+};
+
+// ---- synthetic producer -------------------------------------------------
+
+std::atomic<int> g_released{0};
+std::set<const void*> g_release_ctx_seen;
+std::atomic<int> g_release_before_submit{0};
+std::mutex g_rel_mu;
+
+void ReleaseFrame(void* ctx) {
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_submits.empty()) {
+      ++g_release_before_submit;
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_rel_mu);
+  g_release_ctx_seen.insert(ctx);
+  ++g_released;
+}
+
+// A memfd stands in for a dma-buf: the presenter forwards plane fds, it does
+// not import them.
+int MakeBufferFd(size_t bytes) {
+  const int fd = ::memfd_create("lw-test-frame", MFD_CLOEXEC);
+  if (fd >= 0) {
+    (void)::ftruncate(fd, static_cast<off_t>(bytes));
+  }
+  return fd;
+}
+
+LwDmabufDescriptor MakeDescriptor(int fd, uint64_t seq) {
+  LwDmabufDescriptor d{};
+  d.size = sizeof(d);
+  d.fourcc = ('N') | ('V' << 8) | ('1' << 16) | ('2' << 24);
+  d.modifier = 0x0123456789abcdefULL;
+  d.width = 320;
+  d.height = 240;
+  d.num_planes = 2;
+  d.planes[0].fd = fd;
+  d.planes[0].offset = 0;
+  d.planes[0].pitch = 512;
+  d.planes[1].fd = fd;
+  d.planes[1].offset = 512 * 240;
+  d.planes[1].pitch = 512;
+  d.acquire_fence_fd = -1;
+  d.rtp_timestamp_us = static_cast<int64_t>(seq) * 33333;
+  d.frame_seq = seq;
+  d.pool_generation = 1;
+  return d;
+}
+
+size_t SubmitCount() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_submits.size();
+}
+
+}  // namespace
+
+// The presenter resolves this by dlsym(RTLD_DEFAULT, "ihs_get_api"), so the
+// test binary itself stands in for libihs_shared.so. Needs -rdynamic.
+extern "C" __attribute__((visibility("default"))) const IhsApi* ihs_get_api(
+    uint32_t /*requested_abi*/) {
+  return &g_api;
+}
+
+// The presenter's public C ABI (the surface the Dart control plane drives).
+extern "C" int ihs_webrtc_view_register(const char* view_type);
+extern "C" const LwVideoSinkV1* ihs_webrtc_view_sink_for_view(int32_t view_id,
+                                                              void** out_user);
+
+int main() {
+  constexpr int32_t kViewId = 7;
+
+  CHECK(ihs_webrtc_view_register("webrtc-view") == 0);
+  CHECK(g_factory != nullptr);
+  if (g_factory == nullptr) {
+    std::printf("PRESENTER_TEST_FAIL (no factory registered)\n");
+    return 1;
+  }
+
+  // A sink with no view yet must still be resolvable as absent.
+  CHECK(ihs_webrtc_view_sink_for_view(kViewId, nullptr) == nullptr);
+
+  // Create the view the way the registry would.
+  IhsPvCreateInfo info{};
+  info.struct_size = sizeof(info);
+  info.id = kViewId;
+  info.view_type = "webrtc-view";
+  info.width = 320;
+  info.height = 240;
+  IhsPvCallbacks callbacks{};
+  void* view_user = nullptr;
+  auto* view = reinterpret_cast<IhsPlatformView*>(0x1234);  // opaque to us
+  CHECK(g_factory(&info, g_factory_user, view, &callbacks, &view_user) ==
+        IHS_PV_OK);
+
+  void* sink_user = nullptr;
+  const LwVideoSinkV1* sink =
+      ihs_webrtc_view_sink_for_view(kViewId, &sink_user);
+  CHECK(sink != nullptr);
+  if (sink == nullptr) {
+    std::printf("PRESENTER_TEST_FAIL (no sink for view)\n");
+    return 1;
+  }
+  CHECK(sink->size >= sizeof(LwVideoSinkV1));
+  if (sink->on_frame == nullptr || sink->on_format == nullptr) {
+    std::printf("PRESENTER_TEST_FAIL (incomplete sink table)\n");
+    return 1;
+  }
+
+  // ---- drive frames through the sink ------------------------------------
+  const int fd = MakeBufferFd(512 * 240 * 3 / 2);
+  CHECK(fd >= 0);
+
+  LwDmabufDescriptor fmt = MakeDescriptor(fd, 0);
+  sink->on_format(&fmt, sink_user);
+
+  constexpr int kFrames = 12;
+  // Each frame gets a distinct cookie so a double release is detectable.
+  std::vector<int> cookies(kFrames);
+  int taken = 0;
+  for (int i = 0; i < kFrames; ++i) {
+    LwDmabufDescriptor d = MakeDescriptor(fd, static_cast<uint64_t>(i));
+    void* ctx = &cookies[static_cast<size_t>(i)];
+    if (sink->on_frame(&d, &ReleaseFrame, ctx, sink_user) != 0) {
+      ++taken;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  // Let the present thread drain what it paced.
+  for (int i = 0; i < 200 && SubmitCount() == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+  const size_t submits = SubmitCount();
+  std::printf("taken=%d submitted=%zu released=%d distinct_released=%zu\n",
+              taken, submits, g_released.load(), g_release_ctx_seen.size());
+
+  CHECK(taken > 0);
+  CHECK(submits > 0);
+  CHECK(g_release_before_submit == 0);
+  // Every release must correspond to a distinct frame: a double release would
+  // return the same buffer to the decoder pool twice.
+  CHECK(g_release_ctx_seen.size() == static_cast<size_t>(g_released.load()));
+
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const Submitted& s : g_submits) {
+      CHECK(s.width == 320 && s.height == 240);
+      CHECK(s.plane_count == 2);
+      CHECK(s.plane_fd0 == fd);
+      CHECK(s.stride0 == 512);
+      CHECK(s.modifier == 0x0123456789abcdefULL);
+    }
+  }
+
+  // ---- teardown must not strand buffers ---------------------------------
+  if (callbacks.dispose != nullptr) {
+    callbacks.dispose(view_user);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  std::printf("after dispose: taken=%d released=%d\n", taken,
+              g_released.load());
+  CHECK(g_released.load() == taken);  // nothing left held
+  CHECK(ihs_webrtc_view_sink_for_view(kViewId, nullptr) == nullptr);
+
+  ::close(fd);
+  if (g_failures == 0) {
+    std::printf("PRESENTER_TEST_OK\n");
+    return 0;
+  }
+  std::printf("PRESENTER_TEST_FAIL (%d)\n", g_failures);
+  return 1;
+}

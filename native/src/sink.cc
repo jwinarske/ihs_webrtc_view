@@ -240,6 +240,12 @@ void Presenter::PresentLoop() {
       Submit(std::move(frame));
     }
 
+    // Return whatever the compositor has finished with. Under an explicit
+    // grant this is the normal path and keeps only the frames still in use;
+    // the depth window below is the backstop for implicit sync, and for a
+    // fence that never signals.
+    RetireSignalled();
+
     while (inflight_.size() > kMaxInflight) {
       Retire(inflight_.front());
       inflight_.pop_front();
@@ -279,6 +285,29 @@ void Presenter::Submit(Held&& frame) {
   }
   frame.release_fence_fd = release_fence;
   inflight_.push_back(frame);
+}
+
+void Presenter::RetireSignalled() {
+  // Only an explicit grant carries release fences; with implicit sync there is
+  // nothing to test, so the depth window governs as before.
+  if (grant_.sync == IHS_PV_SYNC_IMPLICIT) {
+    return;
+  }
+  // inflight_ is in submit order, so stop at the first frame the compositor is
+  // still using rather than retiring out of order.
+  while (!inflight_.empty()) {
+    Held& front = inflight_.front();
+    if (front.release_fence_fd >= 0) {
+      pollfd pfd{front.release_fence_fd, POLLIN, 0};
+      if (poll(&pfd, 1, 0) <= 0) {
+        break;  // not signalled yet
+      }
+    }
+    // An explicit grant with no fence means the buffer was already free on
+    // return, so there is nothing to wait for.
+    Retire(inflight_.front());
+    inflight_.pop_front();
+  }
 }
 
 void Presenter::Retire(Held& frame) {
