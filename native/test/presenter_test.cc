@@ -35,6 +35,7 @@
 
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -68,6 +69,7 @@ int g_failures = 0;
 
 struct Submitted {
   uint32_t buffer_id = 0;
+  ino_t plane_ino = 0;
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t plane_count = 0;
@@ -81,9 +83,16 @@ std::mutex g_mu;
 std::vector<Submitted> g_submits;
 
 // Which frame each buffer belongs to, so a submission can be matched to the
-// release that follows it. Every frame gets its own buffer, as a real decoder
-// pool would.
-std::map<int, int> g_fd_to_frame;
+// release that follows it. Keyed on the buffer's inode rather than an fd
+// number: the presenter hands the registry duplicates, which is what the
+// submit contract requires, so the number differs on every frame while the
+// buffer behind it does not.
+std::map<ino_t, int> g_fd_to_frame;
+
+ino_t InodeOf(int fd) {
+  struct stat st;
+  return fstat(fd, &st) == 0 ? st.st_ino : 0;
+}
 std::set<int> g_submitted_frames;
 std::set<int> g_released_frames;
 IhsPvFactory g_factory = nullptr;
@@ -163,9 +172,10 @@ int FakeSubmit(IhsPlatformView* /*view*/, const IhsFrame* frame,
     s.modifier = frame->format.modifier;
     s.fourcc = frame->format.fourcc;
     s.buffer_id = frame->buffer_id;
+    s.plane_ino = InodeOf(frame->plane_fd[0]);
     std::lock_guard<std::mutex> lock(g_mu);
     g_submits.push_back(s);
-    const auto it = g_fd_to_frame.find(frame->plane_fd[0]);
+    const auto it = g_fd_to_frame.find(InodeOf(frame->plane_fd[0]));
     if (it != g_fd_to_frame.end()) {
       g_submitted_frames.insert(it->second);
     }
@@ -386,7 +396,7 @@ PassResult DrivePass(int32_t view_id, uint8_t sync, uint32_t pool_size,
     CHECK(fds[static_cast<size_t>(i)] >= 0);
     cookies[static_cast<size_t>(i)].index = i;
     std::lock_guard<std::mutex> lock(g_mu);
-    g_fd_to_frame[fds[static_cast<size_t>(i)]] = i;
+    g_fd_to_frame[InodeOf(fds[static_cast<size_t>(i)])] = i;
   }
 
   LwDmabufDescriptor fmt = MakeDescriptor(fds[0], 0);
@@ -434,7 +444,7 @@ PassResult DrivePass(int32_t view_id, uint8_t sync, uint32_t pool_size,
     for (const Submitted& s : g_submits) {
       CHECK(s.width == 320 && s.height == 240);
       CHECK(s.plane_count == 2);
-      CHECK(g_fd_to_frame.count(s.plane_fd0) == 1);
+      CHECK(g_fd_to_frame.count(s.plane_ino) == 1);
       CHECK(s.stride0 == 512);
       CHECK(s.modifier == 0x0123456789abcdefULL);
     }
@@ -503,7 +513,7 @@ bool DriveGenerationChange(int32_t view_id) {
     fds[static_cast<size_t>(i)] = MakeBufferFd(512 * 240 * 3 / 2);
     cookies[static_cast<size_t>(i)] = FrameCookie{i, 1};
     std::lock_guard<std::mutex> lock(g_mu);
-    g_fd_to_frame[fds[static_cast<size_t>(i)]] = i;
+    g_fd_to_frame[InodeOf(fds[static_cast<size_t>(i)])] = i;
   }
   LwDmabufDescriptor fmt = MakeDescriptor(fds[0], 0, 320, 240, 1);
   sink->on_format(&fmt, sink_user);
@@ -537,7 +547,7 @@ bool DriveGenerationChange(int32_t view_id) {
       }
     }
     std::lock_guard<std::mutex> lock(g_mu);
-    g_fd_to_frame[fds2[static_cast<size_t>(i)]] = index;
+    g_fd_to_frame[InodeOf(fds2[static_cast<size_t>(i)])] = index;
   }
   std::printf("generation change: %d of %d fd numbers reused\n", recycled,
               kPerGeneration);
@@ -622,7 +632,7 @@ bool DriveRingReuse(int32_t view_id) {
   for (int i = 0; i < kRing; ++i) {
     fds[static_cast<size_t>(i)] = MakeBufferFd(512 * 240 * 3 / 2);
     std::lock_guard<std::mutex> lock(g_mu);
-    g_fd_to_frame[fds[static_cast<size_t>(i)]] = i;
+    g_fd_to_frame[InodeOf(fds[static_cast<size_t>(i)])] = i;
   }
   std::vector<FrameCookie> cookies(kFrames);
   LwDmabufDescriptor fmt = MakeDescriptor(fds[0], 0);
@@ -643,7 +653,7 @@ bool DriveRingReuse(int32_t view_id) {
   {
     std::lock_guard<std::mutex> lock(g_mu);
     for (const Submitted& sub : g_submits) {
-      ids_per_fd[sub.plane_fd0].insert(sub.buffer_id);
+      ids_per_fd[static_cast<int>(sub.plane_ino)].insert(sub.buffer_id);
       all_ids.insert(sub.buffer_id);
     }
     std::printf(
