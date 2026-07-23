@@ -35,6 +35,7 @@
 
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -67,6 +68,8 @@ int g_failures = 0;
 // ---- recording stand-in for the registry --------------------------------
 
 struct Submitted {
+  uint32_t buffer_id = 0;
+  ino_t plane_ino = 0;
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t plane_count = 0;
@@ -80,9 +83,16 @@ std::mutex g_mu;
 std::vector<Submitted> g_submits;
 
 // Which frame each buffer belongs to, so a submission can be matched to the
-// release that follows it. Every frame gets its own buffer, as a real decoder
-// pool would.
-std::map<int, int> g_fd_to_frame;
+// release that follows it. Keyed on the buffer's inode rather than an fd
+// number: the presenter hands the registry duplicates, which is what the
+// submit contract requires, so the number differs on every frame while the
+// buffer behind it does not.
+std::map<ino_t, int> g_fd_to_frame;
+
+ino_t InodeOf(int fd) {
+  struct stat st;
+  return fstat(fd, &st) == 0 ? st.st_ino : 0;
+}
 std::set<int> g_submitted_frames;
 std::set<int> g_released_frames;
 IhsPvFactory g_factory = nullptr;
@@ -108,13 +118,32 @@ int FakeRegisterFactory(const char* /*view_type*/, IhsPvFactory factory,
 }
 void FakeUnregisterFactory(const char* /*view_type*/) { g_factory = nullptr; }
 
+// What this stand-in registry can offer. A real one differs by backend: a
+// Vulkan backend offers dma-buf import and no plane, a DRM-KMS-EGL backend
+// offers both, and every backend offers the software floor.
+uint32_t g_offered_kinds = IHS_PV_KIND_TEXTURE_DMABUF_IMPORT;
+uint32_t g_last_requested_kinds = 0;
+
 int FakeNegotiate(IhsPlatformView* /*view*/,
-                  const IhsPvRequirements* /*requirements*/, IhsPvGrant* out) {
-  if (out == nullptr) {
+                  const IhsPvRequirements* requirements, IhsPvGrant* out) {
+  if (out == nullptr || requirements == nullptr) {
     return IHS_PV_ERR_INVALID;
   }
+  g_last_requested_kinds = requirements->kinds;
+  // Grant only what was asked for. Granting a kind the plugin never requested
+  // hides exactly the mismatch this is here to catch: a plugin that asks for a
+  // plane on a backend that offers only import must not silently work.
+  const uint32_t agreed = requirements->kinds & g_offered_kinds;
+  if (agreed == 0) {
+    return IHS_PV_ERR_UNSUPPORTED;
+  }
+  // Best available, in the order the header ranks them.
   out->struct_size = sizeof(IhsPvGrant);
-  out->granted_kind = IHS_PV_KIND_TEXTURE_DMABUF_IMPORT;
+  out->granted_kind = (agreed & IHS_PV_KIND_DRM_PLANE) != 0
+                          ? IHS_PV_KIND_DRM_PLANE
+                          : ((agreed & IHS_PV_KIND_TEXTURE_DMABUF_IMPORT) != 0
+                                 ? IHS_PV_KIND_TEXTURE_DMABUF_IMPORT
+                                 : IHS_PV_KIND_SOFTWARE_SHM);
   out->sync = g_sync;
   std::memset(&out->format, 0, sizeof(out->format));
   return IHS_PV_OK;
@@ -142,9 +171,11 @@ int FakeSubmit(IhsPlatformView* /*view*/, const IhsFrame* frame,
     s.stride0 = frame->plane_stride[0];
     s.modifier = frame->format.modifier;
     s.fourcc = frame->format.fourcc;
+    s.buffer_id = frame->buffer_id;
+    s.plane_ino = InodeOf(frame->plane_fd[0]);
     std::lock_guard<std::mutex> lock(g_mu);
     g_submits.push_back(s);
-    const auto it = g_fd_to_frame.find(frame->plane_fd[0]);
+    const auto it = g_fd_to_frame.find(InodeOf(frame->plane_fd[0]));
     if (it != g_fd_to_frame.end()) {
       g_submitted_frames.insert(it->second);
     }
@@ -365,7 +396,7 @@ PassResult DrivePass(int32_t view_id, uint8_t sync, uint32_t pool_size,
     CHECK(fds[static_cast<size_t>(i)] >= 0);
     cookies[static_cast<size_t>(i)].index = i;
     std::lock_guard<std::mutex> lock(g_mu);
-    g_fd_to_frame[fds[static_cast<size_t>(i)]] = i;
+    g_fd_to_frame[InodeOf(fds[static_cast<size_t>(i)])] = i;
   }
 
   LwDmabufDescriptor fmt = MakeDescriptor(fds[0], 0);
@@ -413,7 +444,7 @@ PassResult DrivePass(int32_t view_id, uint8_t sync, uint32_t pool_size,
     for (const Submitted& s : g_submits) {
       CHECK(s.width == 320 && s.height == 240);
       CHECK(s.plane_count == 2);
-      CHECK(g_fd_to_frame.count(s.plane_fd0) == 1);
+      CHECK(g_fd_to_frame.count(s.plane_ino) == 1);
       CHECK(s.stride0 == 512);
       CHECK(s.modifier == 0x0123456789abcdefULL);
     }
@@ -482,7 +513,7 @@ bool DriveGenerationChange(int32_t view_id) {
     fds[static_cast<size_t>(i)] = MakeBufferFd(512 * 240 * 3 / 2);
     cookies[static_cast<size_t>(i)] = FrameCookie{i, 1};
     std::lock_guard<std::mutex> lock(g_mu);
-    g_fd_to_frame[fds[static_cast<size_t>(i)]] = i;
+    g_fd_to_frame[InodeOf(fds[static_cast<size_t>(i)])] = i;
   }
   LwDmabufDescriptor fmt = MakeDescriptor(fds[0], 0, 320, 240, 1);
   sink->on_format(&fmt, sink_user);
@@ -516,7 +547,7 @@ bool DriveGenerationChange(int32_t view_id) {
       }
     }
     std::lock_guard<std::mutex> lock(g_mu);
-    g_fd_to_frame[fds2[static_cast<size_t>(i)]] = index;
+    g_fd_to_frame[InodeOf(fds2[static_cast<size_t>(i)])] = index;
   }
   std::printf("generation change: %d of %d fd numbers reused\n", recycled,
               kPerGeneration);
@@ -560,6 +591,89 @@ bool DriveGenerationChange(int32_t view_id) {
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   for (const int fd : fds2) {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+  return true;
+}
+
+// Pushes more frames than there are buffers, so the pool cycles the way a real
+// one does. The registry imports once per buffer_id and reuses that import, so
+// the id has to name the buffer: it must repeat as the ring wraps, and the same
+// buffer must always get the same id.
+bool DriveRingReuse(int32_t view_id) {
+  g_sync = IHS_PV_SYNC_IMPLICIT;
+  g_pool_size = 4;
+  ResetRecording();
+
+  IhsPvCreateInfo info{};
+  info.struct_size = sizeof(info);
+  info.id = view_id;
+  info.view_type = "webrtc-view";
+  info.width = 320;
+  info.height = 240;
+  IhsPvCallbacks callbacks{};
+  void* view_user = nullptr;
+  auto* view = reinterpret_cast<IhsPlatformView*>(0x1234);
+  CHECK(g_factory(&info, g_factory_user, view, &callbacks, &view_user) ==
+        IHS_PV_OK);
+  void* sink_user = nullptr;
+  const LwVideoSinkV1* sink =
+      ihs_webrtc_view_sink_for_view(view_id, &sink_user);
+  CHECK(sink != nullptr);
+  if (sink == nullptr) {
+    return false;
+  }
+
+  constexpr int kRing = 4;
+  constexpr int kFrames = 16;
+  std::vector<int> fds(kRing, -1);
+  for (int i = 0; i < kRing; ++i) {
+    fds[static_cast<size_t>(i)] = MakeBufferFd(512 * 240 * 3 / 2);
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_fd_to_frame[InodeOf(fds[static_cast<size_t>(i)])] = i;
+  }
+  std::vector<FrameCookie> cookies(kFrames);
+  LwDmabufDescriptor fmt = MakeDescriptor(fds[0], 0);
+  sink->on_format(&fmt, sink_user);
+  for (int i = 0; i < kFrames; ++i) {
+    const int fd = fds[static_cast<size_t>(i % kRing)];
+    cookies[static_cast<size_t>(i)] = FrameCookie{i, 1};
+    LwDmabufDescriptor d = MakeDescriptor(fd, static_cast<uint64_t>(i));
+    sink->on_frame(&d, &ReleaseFrame, &cookies[static_cast<size_t>(i)],
+                   sink_user);
+    std::this_thread::sleep_for(std::chrono::milliseconds(33));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // Which id each buffer got, and how many ids were handed out at all.
+  std::map<int, std::set<uint32_t>> ids_per_fd;
+  std::set<uint32_t> all_ids;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const Submitted& sub : g_submits) {
+      ids_per_fd[static_cast<int>(sub.plane_ino)].insert(sub.buffer_id);
+      all_ids.insert(sub.buffer_id);
+    }
+    std::printf(
+        "ring reuse: %zu submits, %zu distinct buffer ids over %d fds\n",
+        g_submits.size(), all_ids.size(), kRing);
+  }
+  CHECK(!all_ids.empty());
+  // Never more ids than buffers: an id per frame would make the registry
+  // import every frame afresh, which is what the cache exists to avoid.
+  CHECK(all_ids.size() <= static_cast<size_t>(kRing));
+  // And stable: one id per buffer, not a fresh one each time it comes round.
+  for (const auto& [fd, ids] : ids_per_fd) {
+    CHECK(ids.size() == 1);
+  }
+
+  if (callbacks.dispose != nullptr) {
+    callbacks.dispose(view_user);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  for (const int fd : fds) {
     if (fd >= 0) {
       ::close(fd);
     }
@@ -615,6 +729,15 @@ int main() {
   CHECK(small_pool.max_hold * 2 <= 9);  // at most a third of the pool
   CHECK(unknown_pool.max_hold <= 3);    // unknown is treated as small
   CHECK(implicit.max_hold <= 9);        // and a large pool still has a bound
+
+  // The presenter must ask for dma-buf import, not only a plane: a Vulkan
+  // backend offers nothing else above the software floor, and a request that
+  // omits it drops to a copy per frame.
+  CHECK((g_last_requested_kinds & IHS_PV_KIND_TEXTURE_DMABUF_IMPORT) != 0);
+  CHECK((g_last_requested_kinds & IHS_PV_KIND_SOFTWARE_SHM) != 0);
+
+  // buffer_id must name the buffer rather than the frame.
+  DriveRingReuse(12);
 
   // A resolution change, with the old pool's fd numbers handed back to the
   // new one.

@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -121,6 +122,16 @@ class Presenter {
   // How many of those to keep, derived from the pool the producer advertises
   // and revisited whenever the pool is reallocated.
   size_t inflight_cap_ = 3;
+
+  // Ring identity for the registry's import cache. It imports each buffer once
+  // and reuses the VkImage/texture, keyed on IhsFrame::buffer_id, so the id has
+  // to name the buffer rather than the frame. Plane fds are unique and stable
+  // within a pool generation, so first sight of an fd assigns the next index;
+  // a new generation clears the map, since the fds are handed straight back to
+  // the new pool and would otherwise alias the old one's imports.
+  std::map<int, uint32_t> buffer_ids_;
+  uint32_t next_buffer_id_ = 0;
+  uint32_t BufferIdFor(int plane_fd);
   std::thread present_thread_;
 };
 

@@ -56,6 +56,20 @@ ihs_shared registry / platform-view params -> Dart `track.bindSink(token)` ->
 `lw_video_track_bind_sink` -> frames flow native-to-native. Unbind on view
 dispose (quiescing).
 
+## Running it end to end
+
+`example/` drives the whole path — peer, hardware decode, presenter, registry —
+and `example/README.md` has the commands, including a Raspberry Pi 4 run over
+`drm-kms-egl`. Two things it depends on that are easy to miss:
+
+- **The shell must be an EGL backend.** The registry samples planar YUV through
+  `GL_TEXTURE_EXTERNAL_OES`, which only the EGL importer does, and only since
+  toyota-connected/ivi-homescreen#335. On a Vulkan backend a YUV frame still
+  renders as a red luma ramp; that importer needs a `VkSamplerYcbcrConversion`.
+- **`LW_V4L2=1` is required.** It selects the in-tree hardware decoder. Without
+  it libwebrtc decodes in software, produces no dma-buf, and the sink is never
+  called — the view mounts and stays black.
+
 ## Tests
 
 ```sh
@@ -87,7 +101,7 @@ native/test/presenter_test.cc               GPU-free presenter checks
 native/test/presenter_live.cc               real frames; needs a GPU
 native/third_party/lw_abi/lw_video_sink.h   vendored C ABI (C-only boundary)
 lib/ihs_webrtc_view.dart                    platform-view widget + bindSink glue
-example/                                     receive + data-channel demo
+example/                                     receive demo + its sending peer
 ```
 
 There is no CI in this repository yet; the checks above are run by hand.

@@ -39,14 +39,19 @@ static void send_framed(const char* header, const char* payload, int len) {
 }
 
 // ---- observer callbacks (signaling thread) ----
-static void on_ice_candidate(const char* candidate, const char* sdp_mid,
-                             int mline, void* user) {
-  (void)sdp_mid;
+// The payloads below are owned by the callback: read them, then hand them
+// back with lw_string_free.
+static void on_ice_candidate(char* candidate, char* sdp_mid, int mline,
+                             void* user) {
   (void)user;
-  char hdr[64];
-  int n = (int)strlen(candidate);
-  snprintf(hdr, sizeof hdr, "CAND %d %d\n", mline, n);
-  send_framed(hdr, candidate, n);
+  if (candidate != NULL) {
+    char hdr[64];
+    int n = (int)strlen(candidate);
+    snprintf(hdr, sizeof hdr, "CAND %d %d\n", mline, n);
+    send_framed(hdr, candidate, n);
+  }
+  lw_string_free(candidate);
+  lw_string_free(sdp_mid);
 }
 static void on_ice_connection_state(int state, void* user) {
   (void)user;
@@ -65,19 +70,23 @@ static void on_track(lw_transceiver_t* transceiver, void* user) {
 }
 
 // ---- SDP async chain ----
-static void on_fail(const char* err, void* user) {
+static void on_fail(char* err, void* user) {
   (void)user;
   fprintf(stderr, "[session] sdp error: %s\n", err ? err : "?");
+  lw_string_free(err);
 }
-static void on_answer_created(const char* sdp, const char* type, void* user) {
-  (void)type;
+static void on_answer_created(char* sdp, char* type, void* user) {
   (void)user;
-  lw_pc_set_local_description(g_s.pc, sdp, "answer", NULL, on_fail, NULL);
-  int n = (int)strlen(sdp);
-  char hdr[64];
-  snprintf(hdr, sizeof hdr, "ANSWER %d\n", n);
-  send_framed(hdr, sdp, n);
-  fprintf(stderr, "[session] answer sent (%d bytes)\n", n);
+  if (sdp != NULL) {
+    lw_pc_set_local_description(g_s.pc, sdp, "answer", NULL, on_fail, NULL);
+    int n = (int)strlen(sdp);
+    char hdr[64];
+    snprintf(hdr, sizeof hdr, "ANSWER %d\n", n);
+    send_framed(hdr, sdp, n);
+    fprintf(stderr, "[session] answer sent (%d bytes)\n", n);
+  }
+  lw_string_free(sdp);
+  lw_string_free(type);
 }
 static void on_remote_offer_set(void* user) {
   (void)user;

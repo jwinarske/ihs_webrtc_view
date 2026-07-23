@@ -1,0 +1,4 @@
+# The toyota-connected/ivi-homescreen revision (branch v2.0) the headers in
+# ihs/ were taken from. They are the contract with libihs_shared.so and the
+# platform-view registry; drift is silent, so record what they came from.
+1249debdf892d1e654b5bbb3f7a2f17191d8400c

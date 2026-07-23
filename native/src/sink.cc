@@ -7,6 +7,7 @@
 // C++ libwebrtc header. The registry performs the KMS/EGL/SHM import; this file
 // only negotiates a slot's worth of buffering and forwards dmabuf frames.
 
+#include <fcntl.h>
 #include <poll.h>
 #include <time.h>
 #include <unistd.h>
@@ -263,6 +264,11 @@ void Presenter::PresentLoop() {
       if (frame.desc.pool_generation != generation_) {
         DrainInflight();
         generation_ = frame.desc.pool_generation;
+        // The new pool reuses the old one's fd numbers, so ids assigned from
+        // them must not carry over or the registry would serve cached imports
+        // of buffers that no longer exist.
+        buffer_ids_.clear();
+        next_buffer_id_ = 0;
       }
       // Track what the producer advertises rather than sampling it once: a
       // reallocated pool may be a different size, and a producer that never
@@ -284,6 +290,16 @@ void Presenter::PresentLoop() {
   }
 }
 
+uint32_t Presenter::BufferIdFor(int plane_fd) {
+  const auto it = buffer_ids_.find(plane_fd);
+  if (it != buffer_ids_.end()) {
+    return it->second;
+  }
+  const uint32_t id = next_buffer_id_++;
+  buffer_ids_.emplace(plane_fd, id);
+  return id;
+}
+
 void Presenter::Submit(Held&& frame) {
   ::IhsFrame f{};
   f.struct_size = sizeof(f);
@@ -294,12 +310,36 @@ void Presenter::Submit(Held&& frame) {
   f.width = frame.desc.width;
   f.height = frame.desc.height;
   f.plane_count = frame.desc.num_planes;
+  // The registry consumes these fds -- it closes them on import, and closes
+  // them again as redundant on a cache hit. The producer only lends them: they
+  // belong to the decoder's pool and stay valid for its lifetime, so handing
+  // them over directly closes the pool out from under the decoder and every
+  // later frame imports a dead fd. Give the registry duplicates to own.
+  bool dup_failed = false;
   for (uint32_t p = 0; p < frame.desc.num_planes && p < 4; ++p) {
-    f.plane_fd[p] = frame.desc.planes[p].fd;
+    f.plane_fd[p] = ::fcntl(frame.desc.planes[p].fd, F_DUPFD_CLOEXEC, 0);
+    if (f.plane_fd[p] < 0) {
+      dup_failed = true;
+    }
     f.plane_offset[p] = frame.desc.planes[p].offset;
     f.plane_stride[p] = frame.desc.planes[p].pitch;
   }
+  if (dup_failed) {
+    for (uint32_t p = 0; p < frame.desc.num_planes && p < 4; ++p) {
+      if (f.plane_fd[p] >= 0) {
+        ::close(f.plane_fd[p]);
+      }
+    }
+    if (frame.release) {
+      frame.release(frame.release_ctx);
+    }
+    return;
+  }
   f.hdr = nullptr;  // SDR
+  // From the producer's own fd, not the duplicate below: a dup gets a fresh
+  // number every frame, which would make every frame a new buffer to the
+  // registry and defeat the import cache it exists to feed.
+  f.buffer_id = BufferIdFor(frame.desc.planes[0].fd);
 
   int release_fence = -1;
   const int rc =
@@ -308,6 +348,13 @@ void Presenter::Submit(Held&& frame) {
                                &release_fence)
           : IHS_PV_ERR_NO_BACKEND;
   if (rc != IHS_PV_OK) {
+    // The registry did not take the frame, so it did not take the duplicates
+    // either.
+    for (uint32_t p = 0; p < frame.desc.num_planes && p < 4; ++p) {
+      if (f.plane_fd[p] >= 0) {
+        ::close(f.plane_fd[p]);
+      }
+    }
     // The registry did not take the frame; retire it immediately.
     if (frame.release) {
       frame.release(frame.release_ctx);
