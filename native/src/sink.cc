@@ -263,6 +263,11 @@ void Presenter::PresentLoop() {
       if (frame.desc.pool_generation != generation_) {
         DrainInflight();
         generation_ = frame.desc.pool_generation;
+        // The new pool reuses the old one's fd numbers, so ids assigned from
+        // them must not carry over or the registry would serve cached imports
+        // of buffers that no longer exist.
+        buffer_ids_.clear();
+        next_buffer_id_ = 0;
       }
       // Track what the producer advertises rather than sampling it once: a
       // reallocated pool may be a different size, and a producer that never
@@ -284,6 +289,16 @@ void Presenter::PresentLoop() {
   }
 }
 
+uint32_t Presenter::BufferIdFor(int plane_fd) {
+  const auto it = buffer_ids_.find(plane_fd);
+  if (it != buffer_ids_.end()) {
+    return it->second;
+  }
+  const uint32_t id = next_buffer_id_++;
+  buffer_ids_.emplace(plane_fd, id);
+  return id;
+}
+
 void Presenter::Submit(Held&& frame) {
   ::IhsFrame f{};
   f.struct_size = sizeof(f);
@@ -300,6 +315,7 @@ void Presenter::Submit(Held&& frame) {
     f.plane_stride[p] = frame.desc.planes[p].pitch;
   }
   f.hdr = nullptr;  // SDR
+  f.buffer_id = BufferIdFor(frame.desc.planes[0].fd);
 
   int release_fence = -1;
   const int rc =

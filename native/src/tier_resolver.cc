@@ -122,7 +122,13 @@ void OnRenegotiate(void* user_data) {
   // software floor. submit is uniform across kinds, so no per-kind rewiring.
   IhsPvRequirements req{};
   req.struct_size = sizeof(req);
-  req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_SOFTWARE_SHM;
+  // Every kind this presenter can drive, best first in intent; the registry
+  // grants the best it can offer. TEXTURE_DMABUF_IMPORT matters as much as the
+  // plane: a Vulkan backend offers only that, and asking for the plane alone
+  // would drop such a backend to the software floor -- a copy per frame, which
+  // is the one outcome the whole path exists to avoid.
+  req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_TEXTURE_DMABUF_IMPORT |
+              IHS_PV_KIND_SOFTWARE_SHM;
   req.formats = &kNv12Linear;
   req.format_count = 1;
   req.sync =
@@ -145,7 +151,13 @@ int Factory(const IhsPvCreateInfo* info, void* /*factory_user*/,
   // Negotiate a surface path. Requesting the software floor guarantees a grant.
   IhsPvRequirements req{};
   req.struct_size = sizeof(req);
-  req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_SOFTWARE_SHM;
+  // Every kind this presenter can drive, best first in intent; the registry
+  // grants the best it can offer. TEXTURE_DMABUF_IMPORT matters as much as the
+  // plane: a Vulkan backend offers only that, and asking for the plane alone
+  // would drop such a backend to the software floor -- a copy per frame, which
+  // is the one outcome the whole path exists to avoid.
+  req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_TEXTURE_DMABUF_IMPORT |
+              IHS_PV_KIND_SOFTWARE_SHM;
   req.formats = &kNv12Linear;
   req.format_count = 1;
   req.needs_alpha = 0;
