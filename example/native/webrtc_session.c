@@ -194,6 +194,13 @@ int webrtc_session_start(const char* host, int port) {
 
 // Returns the decoded video-track handle as an address (0 until OnTrack fires).
 // Stable for the session; hand it to the platform-view binding.
+// The id webrtc gave the remote track. Owned by the caller (lw_string_free),
+// NULL before the track arrives. A consumer that resolves the track by id --
+// as a platform view does -- needs this rather than the handle.
+char* webrtc_session_track_id(void) {
+  return g_s.video_track != NULL ? lw_video_track_id(g_s.video_track) : NULL;
+}
+
 uintptr_t webrtc_session_track(void) {
   return (uintptr_t)g_s.video_track;
 }
