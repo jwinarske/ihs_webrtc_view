@@ -23,6 +23,9 @@
 //     signal rather than only when the depth window forces it
 //   - the depth window follows the pool the producer advertises, so a small
 //     pool is not nearly all held by the presenter
+//   - a resolution change retires every buffer of the old pool before any
+//     frame of the new one is presented, even when the kernel hands back the
+//     same fd numbers
 //
 // The fence path needs no GPU: an eventfd created with a non-zero count is
 // immediately readable, which is exactly what a fence the compositor has
@@ -88,6 +91,15 @@ void* g_factory_user = nullptr;
 // Which sync mode the stand-in registry grants for the current pass.
 uint8_t g_sync = IHS_PV_SYNC_IMPLICIT;
 
+// Generation accounting, for the resolution-change check.
+std::atomic<int> g_gen1_taken{0};
+std::atomic<int> g_gen1_released{0};
+// How many first-generation buffers were still out when the first frame of the
+// second generation was submitted. Must be none: their fd numbers may since
+// have been handed to the new pool.
+std::atomic<int> g_gen1_outstanding_at_switch{-1};
+std::atomic<uint32_t> g_switch_width{0};
+
 int FakeRegisterFactory(const char* /*view_type*/, IhsPvFactory factory,
                         void* user) {
   g_factory = factory;
@@ -136,6 +148,13 @@ int FakeSubmit(IhsPlatformView* /*view*/, const IhsFrame* frame,
     if (it != g_fd_to_frame.end()) {
       g_submitted_frames.insert(it->second);
     }
+    // Geometry, not the fd, tells the generations apart: the point of the
+    // check is that the fd numbers may have been reused.
+    if (g_switch_width != 0 && frame->width == g_switch_width &&
+        g_gen1_outstanding_at_switch.load() < 0) {
+      g_gen1_outstanding_at_switch =
+          g_gen1_taken.load() - g_gen1_released.load();
+    }
   }
   return IHS_PV_OK;
 }
@@ -176,6 +195,7 @@ std::mutex g_rel_mu;
 // Identifies the frame a release belongs to.
 struct FrameCookie {
   int index = -1;
+  uint32_t generation = 1;
 };
 
 void ReleaseFrame(void* ctx) {
@@ -187,6 +207,9 @@ void ReleaseFrame(void* ctx) {
     }
     if (cookie != nullptr) {
       g_released_frames.insert(cookie->index);
+      if (cookie->generation == 1) {
+        ++g_gen1_released;
+      }
     }
   }
   std::lock_guard<std::mutex> lock(g_rel_mu);
@@ -207,13 +230,15 @@ int MakeBufferFd(size_t bytes) {
 // What the producer claims its pool holds, for the current pass.
 uint32_t g_pool_size = 0;
 
-LwDmabufDescriptor MakeDescriptor(int fd, uint64_t seq) {
+LwDmabufDescriptor MakeDescriptor(int fd, uint64_t seq, uint32_t width = 320,
+                                  uint32_t height = 240,
+                                  uint32_t generation = 1) {
   LwDmabufDescriptor d{};
   d.size = sizeof(d);
   d.fourcc = ('N') | ('V' << 8) | ('1' << 16) | ('2' << 24);
   d.modifier = 0x0123456789abcdefULL;
-  d.width = 320;
-  d.height = 240;
+  d.width = width;
+  d.height = height;
   d.num_planes = 2;
   d.planes[0].fd = fd;
   d.planes[0].offset = 0;
@@ -224,7 +249,7 @@ LwDmabufDescriptor MakeDescriptor(int fd, uint64_t seq) {
   d.acquire_fence_fd = -1;
   d.rtp_timestamp_us = static_cast<int64_t>(seq) * 33333;
   d.frame_seq = seq;
-  d.pool_generation = 1;
+  d.pool_generation = generation;
   d.pool_size = g_pool_size;
   return d;
 }
@@ -413,6 +438,135 @@ PassResult DrivePass(int32_t view_id, uint8_t sync, uint32_t pool_size,
   return result;
 }
 
+// Drives a resolution change: one pool at 320x240, then a second at 640x480
+// whose buffers reuse the same fd numbers, which is what the kernel does once
+// the first pool's fds are closed. The presenter must retire every buffer of
+// the old pool before presenting any frame of the new one -- otherwise it
+// would hand back a release for an fd number that now belongs to a different
+// buffer.
+bool DriveGenerationChange(int32_t view_id) {
+  g_sync = IHS_PV_SYNC_IMPLICIT;
+  g_pool_size = 12;
+  ResetRecording();
+  g_gen1_taken = 0;
+  g_gen1_released = 0;
+  g_gen1_outstanding_at_switch = -1;
+  g_switch_width = 0;
+
+  IhsPvCreateInfo info{};
+  info.struct_size = sizeof(info);
+  info.id = view_id;
+  info.view_type = "webrtc-view";
+  info.width = 320;
+  info.height = 240;
+  IhsPvCallbacks callbacks{};
+  void* view_user = nullptr;
+  auto* view = reinterpret_cast<IhsPlatformView*>(0x1234);
+  CHECK(g_factory(&info, g_factory_user, view, &callbacks, &view_user) ==
+        IHS_PV_OK);
+
+  void* sink_user = nullptr;
+  const LwVideoSinkV1* sink =
+      ihs_webrtc_view_sink_for_view(view_id, &sink_user);
+  CHECK(sink != nullptr);
+  if (sink == nullptr) {
+    return false;
+  }
+
+  constexpr int kPerGeneration = 12;
+  std::vector<FrameCookie> cookies(kPerGeneration * 2);
+
+  // ---- first pool ---------------------------------------------------------
+  std::vector<int> fds(kPerGeneration, -1);
+  for (int i = 0; i < kPerGeneration; ++i) {
+    fds[static_cast<size_t>(i)] = MakeBufferFd(512 * 240 * 3 / 2);
+    cookies[static_cast<size_t>(i)] = FrameCookie{i, 1};
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_fd_to_frame[fds[static_cast<size_t>(i)]] = i;
+  }
+  LwDmabufDescriptor fmt = MakeDescriptor(fds[0], 0, 320, 240, 1);
+  sink->on_format(&fmt, sink_user);
+  for (int i = 0; i < kPerGeneration; ++i) {
+    LwDmabufDescriptor d = MakeDescriptor(
+        fds[static_cast<size_t>(i)], static_cast<uint64_t>(i), 320, 240, 1);
+    if (sink->on_frame(&d, &ReleaseFrame, &cookies[static_cast<size_t>(i)],
+                       sink_user) != 0) {
+      ++g_gen1_taken;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(33));
+  }
+
+  // Close the first pool's fds so the kernel is free to hand the numbers back.
+  for (const int fd : fds) {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+
+  // ---- second pool, at a new size ----------------------------------------
+  std::vector<int> fds2(kPerGeneration, -1);
+  int recycled = 0;
+  for (int i = 0; i < kPerGeneration; ++i) {
+    fds2[static_cast<size_t>(i)] = MakeBufferFd(1024 * 480 * 3 / 2);
+    const int index = kPerGeneration + i;
+    cookies[static_cast<size_t>(index)] = FrameCookie{index, 2};
+    for (const int old_fd : fds) {
+      if (old_fd == fds2[static_cast<size_t>(i)]) {
+        ++recycled;
+      }
+    }
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_fd_to_frame[fds2[static_cast<size_t>(i)]] = index;
+  }
+  std::printf("generation change: %d of %d fd numbers reused\n", recycled,
+              kPerGeneration);
+
+  g_switch_width = 640;
+  LwDmabufDescriptor fmt2 = MakeDescriptor(fds2[0], 0, 640, 480, 2);
+  sink->on_format(&fmt2, sink_user);
+  for (int i = 0; i < kPerGeneration; ++i) {
+    LwDmabufDescriptor d =
+        MakeDescriptor(fds2[static_cast<size_t>(i)],
+                       static_cast<uint64_t>(kPerGeneration + i), 640, 480, 2);
+    sink->on_frame(&d, &ReleaseFrame,
+                   &cookies[static_cast<size_t>(kPerGeneration + i)],
+                   sink_user);
+    std::this_thread::sleep_for(std::chrono::milliseconds(33));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // The new size must actually have reached the registry, or the check above
+  // never fired and proves nothing.
+  size_t submitted_new = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const Submitted& sub : g_submits) {
+      if (sub.width == 640 && sub.height == 480) {
+        ++submitted_new;
+      }
+    }
+  }
+  std::printf(
+      "generation change: gen1 taken=%d released=%d, outstanding at switch=%d, "
+      "new-size submits=%zu\n",
+      g_gen1_taken.load(), g_gen1_released.load(),
+      g_gen1_outstanding_at_switch.load(), submitted_new);
+
+  CHECK(submitted_new > 0);
+  CHECK(g_gen1_outstanding_at_switch.load() == 0);
+
+  if (callbacks.dispose != nullptr) {
+    callbacks.dispose(view_user);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  for (const int fd : fds2) {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -461,6 +615,10 @@ int main() {
   CHECK(small_pool.max_hold * 2 <= 9);  // at most a third of the pool
   CHECK(unknown_pool.max_hold <= 3);    // unknown is treated as small
   CHECK(implicit.max_hold <= 9);        // and a large pool still has a bound
+
+  // A resolution change, with the old pool's fd numbers handed back to the
+  // new one.
+  DriveGenerationChange(11);
 
   if (g_failures == 0) {
     std::printf("PRESENTER_TEST_OK\n");
