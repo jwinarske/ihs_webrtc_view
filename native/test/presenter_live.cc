@@ -46,18 +46,13 @@
 #include "ihs/platform_view.h"
 #include "lw_video_sink.h"
 
-// libwebrtc: the C sink registry plus the C++ session API.
+// libwebrtc, through its flat C ABI only -- the same surface the presenter and
+// the Dart control plane use. Speaking C++ here coupled this tool to the
+// library's vtable layout, which is what a define mismatch turns into a crash.
 #include "c/lw_c_api.h"
-#include "libwebrtc.h"
-#include "rtc_peerconnection.h"
-#include "rtc_peerconnection_factory.h"
-#include "rtc_video_frame.h"
-#include "rtc_video_source.h"
-#include "rtc_video_track.h"
 
 namespace {
 
-using namespace libwebrtc;
 using Clock = std::chrono::steady_clock;
 
 constexpr int kWidth = 320;
@@ -255,74 +250,97 @@ struct Candidate {
   std::string candidate;
 };
 
-class Peer : public RTCPeerConnectionObserver {
- public:
-  scoped_refptr<RTCPeerConnection> pc;
-  Peer* peer = nullptr;
+// A peer, driven entirely through the C ABI.
+struct CPeer {
+  lw_pc_t* pc = nullptr;
+  CPeer* peer = nullptr;
   bool receives = false;
   lw_video_sink_token token = 0;
+  lw_video_track_t* remote_track = nullptr;
   std::atomic<bool> remote_set{false};
 
-  void OnSignalingState(RTCSignalingState) override {}
-  void OnPeerConnectionState(RTCPeerConnectionState) override {}
-  void OnIceGatheringState(RTCIceGatheringState) override {}
-  void OnIceConnectionState(RTCIceConnectionState) override {}
-  void OnIceCandidate(scoped_refptr<RTCIceCandidate> c) override {
-    if (!c || !peer) {
-      return;
-    }
-    Candidate cand{c->sdp_mid().std_string(), c->sdp_mline_index(),
-                   c->candidate().std_string()};
+  void Send(const Candidate& c) {
     if (peer->remote_set) {
-      peer->pc->AddCandidate(cand.mid.c_str(), cand.index,
-                             cand.candidate.c_str());
+      lw_pc_add_ice_candidate(peer->pc, c.mid.c_str(), c.index,
+                              c.candidate.c_str());
     } else {
-      std::lock_guard<std::mutex> lock(mu_);
-      outbox_.push_back(std::move(cand));
+      std::lock_guard<std::mutex> lock(mu);
+      outbox.push_back(c);
     }
   }
-  void FlushCandidatesTo(Peer* to) {
-    std::lock_guard<std::mutex> lock(mu_);
-    for (const Candidate& c : outbox_) {
-      to->pc->AddCandidate(c.mid.c_str(), c.index, c.candidate.c_str());
-    }
-    outbox_.clear();
-  }
-  void OnAddStream(scoped_refptr<RTCMediaStream>) override {}
-  void OnRemoveStream(scoped_refptr<RTCMediaStream>) override {}
-  void OnDataChannel(scoped_refptr<RTCDataChannel>) override {}
-  void OnRenegotiationNeeded() override {}
-  void OnTrack(scoped_refptr<RTCRtpTransceiver> transceiver) override {
-    if (!receives || !transceiver || token == 0) {
-      return;
-    }
-    scoped_refptr<RTCRtpReceiver> receiver = transceiver->receiver();
-    if (!receiver) {
-      return;
-    }
-    scoped_refptr<RTCMediaTrack> track = receiver->track();
-    auto* video = dynamic_cast<RTCVideoTrack*>(track.get());
-    if (video == nullptr) {
-      return;
-    }
-    held_ = scoped_refptr<RTCVideoTrack>(video);  // keep the adapter alive
-    const int rc = lw_video_track_bind_sink(
-        reinterpret_cast<lw_video_track_t*>(video), token);
-    std::printf("bound presenter sink to the decoded track (rc=%d)\n", rc);
-  }
-  void OnAddTrack(vector<scoped_refptr<RTCMediaStream>>,
-                  scoped_refptr<RTCRtpReceiver>) override {}
-  void OnRemoveTrack(scoped_refptr<RTCRtpReceiver>) override {}
 
- private:
-  std::mutex mu_;
-  std::vector<Candidate> outbox_;
-  scoped_refptr<RTCVideoTrack> held_;
+  void FlushCandidates() {
+    std::lock_guard<std::mutex> lock(mu);
+    for (const Candidate& c : outbox) {
+      lw_pc_add_ice_candidate(peer->pc, c.mid.c_str(), c.index,
+                              c.candidate.c_str());
+    }
+    outbox.clear();
+  }
+
+  std::mutex mu;
+  std::vector<Candidate> outbox;
 };
 
+void OnIceCandidate(char* candidate, char* mid, int mline_index, void* user) {
+  Candidate cand{mid != nullptr ? mid : "", mline_index,
+                 candidate != nullptr ? candidate : ""};
+  lw_string_free(candidate);
+  lw_string_free(mid);
+  static_cast<CPeer*>(user)->Send(cand);
+}
+
+void OnTrack(lw_transceiver_t* transceiver, void* user) {
+  auto* self = static_cast<CPeer*>(user);
+  lw_receiver_t* receiver = lw_transceiver_receiver(transceiver);
+  lw_release(transceiver);
+  if (receiver == nullptr || !self->receives) {
+    lw_release(receiver);
+    return;
+  }
+  self->remote_track = lw_receiver_video_track(receiver);
+  lw_release(receiver);
+  if (self->remote_track == nullptr) {
+    return;
+  }
+  const int rc = lw_video_track_bind_sink(self->remote_track, self->token);
+  std::printf("bound presenter sink to the decoded track (rc=%d)\n", rc);
+}
+
+// SDP callbacks take ownership of their strings.
+struct SdpResult {
+  std::string sdp;
+  std::atomic<bool> done{false};
+};
+
+void OnSdp(char* sdp, char* type, void* user) {
+  auto* result = static_cast<SdpResult*>(user);
+  result->sdp = sdp != nullptr ? sdp : "";
+  lw_string_free(sdp);
+  lw_string_free(type);
+  result->done = true;
+}
+
+void OnSdpFailure(char* error, void* user) {
+  std::printf("  sdp failure: %s\n", error != nullptr ? error : "?");
+  lw_string_free(error);
+  static_cast<SdpResult*>(user)->done = true;
+}
+
+void OnSetDone(void* user) { *static_cast<std::atomic<bool>*>(user) = true; }
+
+void OnSetFailure(char* error, void* user) {
+  std::printf("  set description failure: %s\n",
+              error != nullptr ? error : "?");
+  lw_string_free(error);
+  *static_cast<std::atomic<bool>*>(user) = true;
+}
+
+SdpResult g_offer;
+SdpResult g_answer;
+std::atomic<bool> g_set_done_flag{false};
+
 std::string g_sdp;
-std::atomic<bool> g_sdp_done{false};
-std::atomic<bool> g_set_done{false};
 
 bool Wait(std::atomic<bool>* flag, int timeout_ms = 10000) {
   for (int i = 0; i < timeout_ms / 10 && !*flag; ++i) {
@@ -494,13 +512,12 @@ int main() {
   }
 
   // ---- bring up the session and hand the presenter's sink to the track ---
-  if (!LibWebRTC::Initialize()) {
+  if (lw_initialize() == 0) {
     std::printf("RESULT: FAIL (initialize)\n");
     return 1;
   }
-  scoped_refptr<RTCPeerConnectionFactory> factory =
-      LibWebRTC::CreateRTCPeerConnectionFactory();
-  if (!factory || !factory->Initialize()) {
+  lw_factory_t* factory = lw_factory_create();
+  if (factory == nullptr || lw_factory_initialize(factory) == 0) {
     std::printf("RESULT: FAIL (factory)\n");
     return 1;
   }
@@ -517,75 +534,78 @@ int main() {
     return 1;
   }
 
-  RTCConfiguration config;
-  scoped_refptr<RTCMediaConstraints> constraints =
-      RTCMediaConstraints::Create();
-  Peer sender;
-  Peer receiver;
+  CPeer sender;
+  CPeer receiver;
   receiver.receives = true;
   receiver.token = token;
   sender.peer = &receiver;
   receiver.peer = &sender;
-  sender.pc = factory->Create(config, constraints);
-  receiver.pc = factory->Create(config, constraints);
-  sender.pc->RegisterRTCPeerConnectionObserver(&sender);
-  receiver.pc->RegisterRTCPeerConnectionObserver(&receiver);
+  sender.pc = lw_pc_create(factory);
+  receiver.pc = lw_pc_create(factory);
+  if (sender.pc == nullptr || receiver.pc == nullptr) {
+    std::printf("RESULT: FAIL (peer connection)\n");
+    return 1;
+  }
 
-  scoped_refptr<RTCVideoSource> source =
-      factory->CreateCustomVideoSource("live-source", constraints);
-  scoped_refptr<RTCVideoTrack> track =
-      factory->CreateVideoTrack(source, "live-video");
-  std::vector<string> stream_ids;
-  stream_ids.push_back(string("live-stream"));
-  sender.pc->AddTrack(track, vector<string>(stream_ids));
+  LwPcObserver observer{};
+  observer.size = sizeof(observer);
+  observer.on_ice_candidate = OnIceCandidate;
+  observer.on_track = OnTrack;
+  if (lw_pc_set_observer(sender.pc, &observer, &sender) != 0 ||
+      lw_pc_set_observer(receiver.pc, &observer, &receiver) != 0) {
+    std::printf("RESULT: FAIL (observer)\n");
+    return 1;
+  }
 
-  g_sdp_done = false;
-  sender.pc->CreateOffer(
-      [](const string& sdp, const string&) {
-        g_sdp = ForceH264(sdp.std_string());
-        g_sdp_done = true;
-      },
-      [](const char*) { g_sdp_done = true; }, constraints);
-  if (!Wait(&g_sdp_done) || g_sdp.find("H264") == std::string::npos) {
+  lw_video_source_t* source =
+      lw_factory_create_video_source(factory, "live-source");
+  lw_video_track_t* track =
+      lw_factory_create_video_track(factory, source, "live-video");
+  const char* stream_ids[] = {"live-stream"};
+  lw_sender_t* rtp_sender = lw_pc_add_track(sender.pc, track, stream_ids, 1);
+  if (source == nullptr || track == nullptr || rtp_sender == nullptr) {
+    std::printf("RESULT: FAIL (local video)\n");
+    return 1;
+  }
+
+  lw_pc_create_offer(sender.pc, OnSdp, OnSdpFailure, &g_offer);
+  if (!Wait(&g_offer.done) || g_offer.sdp.empty()) {
+    std::printf("RESULT: FAIL (no offer)\n");
+    return 1;
+  }
+  g_sdp = ForceH264(g_offer.sdp);
+  if (g_sdp.find("H264") == std::string::npos) {
     std::printf("RESULT: FAIL (no H.264 offer)\n");
     return 1;
   }
-  auto set_description = [&](const scoped_refptr<RTCPeerConnection>& pc,
-                             bool local, const std::string& sdp,
-                             const char* type) {
-    g_set_done = false;
+
+  auto set_description = [](lw_pc_t* pc, bool local, const std::string& sdp,
+                            const char* type) {
+    g_set_done_flag = false;
     if (local) {
-      pc->SetLocalDescription(
-          sdp.c_str(), type, [] { g_set_done = true; },
-          [](const char*) { g_set_done = true; });
+      lw_pc_set_local_description(pc, sdp.c_str(), type, OnSetDone,
+                                  OnSetFailure, &g_set_done_flag);
     } else {
-      pc->SetRemoteDescription(
-          sdp.c_str(), type, [] { g_set_done = true; },
-          [](const char*) { g_set_done = true; });
+      lw_pc_set_remote_description(pc, sdp.c_str(), type, OnSetDone,
+                                   OnSetFailure, &g_set_done_flag);
     }
-    return Wait(&g_set_done);
+    return Wait(&g_set_done_flag);
   };
+
   set_description(sender.pc, true, g_sdp, "offer");
   set_description(receiver.pc, false, g_sdp, "offer");
   receiver.remote_set = true;
-  sender.FlushCandidatesTo(&receiver);
+  sender.FlushCandidates();
 
-  std::string answer;
-  g_sdp_done = false;
-  receiver.pc->CreateAnswer(
-      [&answer](const string& sdp, const string&) {
-        answer = sdp.std_string();
-        g_sdp_done = true;
-      },
-      [](const char*) { g_sdp_done = true; }, constraints);
-  if (!Wait(&g_sdp_done) || answer.empty()) {
+  lw_pc_create_answer(receiver.pc, OnSdp, OnSdpFailure, &g_answer);
+  if (!Wait(&g_answer.done) || g_answer.sdp.empty()) {
     std::printf("RESULT: FAIL (no answer)\n");
     return 1;
   }
-  set_description(receiver.pc, true, answer, "answer");
-  set_description(sender.pc, false, answer, "answer");
+  set_description(receiver.pc, true, g_answer.sdp, "answer");
+  set_description(sender.pc, false, g_answer.sdp, "answer");
   sender.remote_set = true;
-  receiver.FlushCandidatesTo(&sender);
+  receiver.FlushCandidates();
 
   // ---- feed frames until enough have reached the compositor --------------
   std::vector<uint8_t> i420(static_cast<size_t>(kWidth) * kHeight * 3 / 2);
@@ -598,8 +618,11 @@ int main() {
     }
     std::memset(i420.data() + static_cast<size_t>(kWidth) * kHeight, 128,
                 static_cast<size_t>(kWidth) * kHeight / 2);
-    source->OnCapturedFrame(RTCVideoFrame::Create(
-        kWidth, kHeight, i420.data(), static_cast<int>(i420.size())));
+    if (lw_video_source_push_i420(source, kWidth, kHeight, i420.data(),
+                                  i420.size()) != 0) {
+      std::printf("RESULT: FAIL (push frame)\n");
+      return 1;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(33));
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -614,9 +637,21 @@ int main() {
   if (callbacks.dispose != nullptr) {
     callbacks.dispose(view_user);
   }
+  if (receiver.remote_track != nullptr) {
+    lw_video_track_unbind_sink(receiver.remote_track);
+    lw_release(receiver.remote_track);
+  }
   lw_video_sink_unregister(token);
-  sender.pc->Close();
-  receiver.pc->Close();
-  LibWebRTC::Terminate();
+  lw_pc_remove_observer(sender.pc);
+  lw_pc_remove_observer(receiver.pc);
+  lw_pc_close(sender.pc);
+  lw_pc_close(receiver.pc);
+  lw_release(rtp_sender);
+  lw_release(track);
+  lw_release(source);
+  lw_release(sender.pc);
+  lw_release(receiver.pc);
+  lw_release(factory);
+  lw_terminate();
   return pass ? 0 : 1;
 }
