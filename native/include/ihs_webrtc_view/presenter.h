@@ -118,6 +118,9 @@ class Presenter {
 
   std::deque<Held>
       inflight_;  // submitted, not yet retired (present thread only)
+  // How many of those to keep, derived from the pool the producer advertises
+  // and revisited whenever the pool is reallocated.
+  size_t inflight_cap_ = 3;
   std::thread present_thread_;
 };
 

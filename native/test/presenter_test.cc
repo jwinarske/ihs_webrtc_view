@@ -21,6 +21,8 @@
 //   - suspending stops submissions without stranding buffers
 //   - under an explicit grant, buffers are retired as their release fences
 //     signal rather than only when the depth window forces it
+//   - the depth window follows the pool the producer advertises, so a small
+//     pool is not nearly all held by the presenter
 //
 // The fence path needs no GPU: an eventfd created with a non-zero count is
 // immediately readable, which is exactly what a fence the compositor has
@@ -202,6 +204,9 @@ int MakeBufferFd(size_t bytes) {
   return fd;
 }
 
+// What the producer claims its pool holds, for the current pass.
+uint32_t g_pool_size = 0;
+
 LwDmabufDescriptor MakeDescriptor(int fd, uint64_t seq) {
   LwDmabufDescriptor d{};
   d.size = sizeof(d);
@@ -220,6 +225,7 @@ LwDmabufDescriptor MakeDescriptor(int fd, uint64_t seq) {
   d.rtp_timestamp_us = static_cast<int64_t>(seq) * 33333;
   d.frame_seq = seq;
   d.pool_generation = 1;
+  d.pool_size = g_pool_size;
   return d;
 }
 
@@ -286,9 +292,11 @@ namespace {
 
 // Drives one pass: creates a view, pushes frames through the sink, and tears
 // it down. `sync` selects what the stand-in registry grants.
-PassResult DrivePass(int32_t view_id, uint8_t sync, const char* label) {
+PassResult DrivePass(int32_t view_id, uint8_t sync, uint32_t pool_size,
+                     const char* label) {
   PassResult result;
   g_sync = sync;
+  g_pool_size = pool_size;
   ResetRecording();
 
   // Create the view the way the registry would.
@@ -418,9 +426,18 @@ int main() {
   // A sink with no view yet must still be resolvable as absent.
   CHECK(ihs_webrtc_view_sink_for_view(7, nullptr) == nullptr);
 
-  const PassResult implicit = DrivePass(7, IHS_PV_SYNC_IMPLICIT, "implicit");
+  // A VAAPI-sized pool: holding a handful leaves plenty to decode into.
+  const PassResult implicit =
+      DrivePass(7, IHS_PV_SYNC_IMPLICIT, 28, "implicit/pool28");
   const PassResult explicit_sync =
-      DrivePass(8, IHS_PV_SYNC_EXPLICIT_REQUIRED, "explicit");
+      DrivePass(8, IHS_PV_SYNC_EXPLICIT_REQUIRED, 28, "explicit/pool28");
+  // A V4L2-sized pool: reorder depth plus pipeline plus one. The presenter
+  // must not hold most of this.
+  const PassResult small_pool =
+      DrivePass(9, IHS_PV_SYNC_IMPLICIT, 9, "implicit/pool9");
+  // A producer that does not say. Treated as small.
+  const PassResult unknown_pool =
+      DrivePass(10, IHS_PV_SYNC_IMPLICIT, 0, "implicit/unknown");
 
   // The point of retiring on the fence: with the compositor already done, a
   // buffer goes back to the producer immediately instead of waiting for the
@@ -436,6 +453,14 @@ int main() {
   // sync still has a window's worth in hand for teardown to drain.
   CHECK(explicit_sync.released_in_run == explicit_sync.taken);
   CHECK(implicit.released_in_run < implicit.taken);
+
+  // The window follows the pool. Against nine buffers the presenter must leave
+  // the decoder enough to work with, where against twenty-eight it can hold
+  // more without starving anything.
+  CHECK(small_pool.max_hold < implicit.max_hold);
+  CHECK(small_pool.max_hold * 2 <= 9);  // at most a third of the pool
+  CHECK(unknown_pool.max_hold <= 3);    // unknown is treated as small
+  CHECK(implicit.max_hold <= 9);        // and a large pool still has a bound
 
   if (g_failures == 0) {
     std::printf("PRESENTER_TEST_OK\n");

@@ -20,13 +20,40 @@
 namespace ihs_webrtc_view {
 namespace {
 
-// Presenter-held buffers cap. The decoder CAPTURE pool has headroom (>= 16); we
-// keep at most this many submitted-but-not-retired so a buffer is not re-queued
-// to the decoder until the implicit-sync scanout path (scene overlay) has long
-// finished with it — a wide margin against the decoder overwriting a buffer the
-// KMS plane is still scanning (tearing). Must stay below the CAPTURE count so
-// the decoder never starves for a free buffer to decode into.
+// Upper bound on presenter-held buffers, whatever the pool size says. Holding
+// submitted-but-not-retired frames keeps a buffer from being re-queued to the
+// decoder until the implicit-sync scanout path (scene overlay) has finished
+// with it — margin against the decoder overwriting a buffer the KMS plane is
+// still scanning (tearing).
 constexpr size_t kMaxInflight = 8;
+
+// What to hold when the producer does not say how big its pool is. Small
+// enough to be safe against the smallest pool likely to turn up, since the
+// cost of guessing high is a starved decoder and the cost of guessing low is
+// only less tolerance for bursty delivery.
+constexpr size_t kDefaultInflight = 3;
+
+// Fraction of the producer's pool the presenter will hold. The decoder needs
+// the rest to decode into: reference frames, reorder depth and the buffer
+// currently being written. A third leaves two thirds with the producer.
+constexpr size_t kPoolShareDivisor = 3;
+
+// How many buffers to hold given the pool the producer advertises.
+//
+// Pools differ by an order of magnitude — a VAAPI surface pool runs to dozens,
+// a V4L2 CAPTURE pool is often reorder depth plus pipeline plus one, so eight
+// to ten — so a fixed depth cannot suit both: eight is comfortable against
+// twenty-eight surfaces and nearly the whole of a nine-buffer pool.
+size_t InflightCapForPool(uint32_t pool_size) {
+  if (pool_size == 0) {
+    return kDefaultInflight;  // unknown: assume small
+  }
+  const size_t share = pool_size / kPoolShareDivisor;
+  if (share < 2) {
+    return 2;  // one on screen, one arriving
+  }
+  return share < kMaxInflight ? share : kMaxInflight;
+}
 
 // Bounded wait for a release fence before force-retiring a buffer (~2 vsync at
 // 60 Hz + margin), matching the sink contract's release watchdog.
@@ -237,6 +264,10 @@ void Presenter::PresentLoop() {
         DrainInflight();
         generation_ = frame.desc.pool_generation;
       }
+      // Track what the producer advertises rather than sampling it once: a
+      // reallocated pool may be a different size, and a producer that never
+      // changes generation would otherwise never be read at all.
+      inflight_cap_ = InflightCapForPool(frame.desc.pool_size);
       Submit(std::move(frame));
     }
 
@@ -246,7 +277,7 @@ void Presenter::PresentLoop() {
     // fence that never signals.
     RetireSignalled();
 
-    while (inflight_.size() > kMaxInflight) {
+    while (inflight_.size() > inflight_cap_) {
       Retire(inflight_.front());
       inflight_.pop_front();
     }
