@@ -112,6 +112,32 @@ void OnSetSuspended(void* user_data, uint8_t suspended) {
   }
 }
 
+// Pointer/touch + gesture-arena arbitration from the registry (platform
+// thread), forwarded to the per-view presenter, which queues them for its
+// present thread.
+void OnTouch(void* user_data, int32_t action, int32_t point_count,
+             size_t pointer_data_size, const double* pointer_data) {
+  auto* st = static_cast<ViewState*>(user_data);
+  if (st->presenter) {
+    st->presenter->OnTouch(action, point_count, pointer_data_size,
+                           pointer_data);
+  }
+}
+
+void OnAcceptGesture(void* user_data) {
+  auto* st = static_cast<ViewState*>(user_data);
+  if (st->presenter) {
+    st->presenter->OnAcceptGesture();
+  }
+}
+
+void OnRejectGesture(void* user_data) {
+  auto* st = static_cast<ViewState*>(user_data);
+  if (st->presenter) {
+    st->presenter->OnRejectGesture();
+  }
+}
+
 void OnRenegotiate(void* user_data) {
   auto* st = static_cast<ViewState*>(user_data);
   const Ihs& ihs = ResolveIhs();
@@ -184,6 +210,9 @@ int Factory(const IhsPvCreateInfo* info, void* /*factory_user*/,
 
   std::memset(out_callbacks, 0, sizeof(*out_callbacks));
   out_callbacks->struct_size = sizeof(*out_callbacks);
+  out_callbacks->on_touch = &OnTouch;
+  out_callbacks->accept_gesture = &OnAcceptGesture;
+  out_callbacks->reject_gesture = &OnRejectGesture;
   out_callbacks->set_suspended = &OnSetSuspended;
   out_callbacks->renegotiate = &OnRenegotiate;
   out_callbacks->dispose = &OnDispose;
@@ -227,6 +256,15 @@ ihs_webrtc_view_sink_for_view(int32_t view_id, void** out_user) {
     *out_user = p->sink_user();
   }
   return p->sink();
+}
+
+// Total input samples the view's present thread has consumed since creation.
+// An observability/bring-up hook ("is touch reaching the view?") and what the
+// unit test checks. Returns 0 if the view does not exist.
+__attribute__((visibility("default"))) uint64_t
+ihs_webrtc_view_touch_count(int32_t view_id) {
+  auto* p = ihs_webrtc_view::FindPresenter(view_id);
+  return p ? p->touches_consumed() : 0;
 }
 
 }  // extern "C"
