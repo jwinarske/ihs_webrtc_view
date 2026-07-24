@@ -188,10 +188,68 @@ class _WebRtcViewController extends PlatformViewController {
     await _channel.invokeMethod<void>('clearFocus', _viewId);
   }
 
+  // Android MotionEvent actions the embedder's PlatformViewTouch decodes. The
+  // flutter/platform_views 'touch' contract is the Android motion-event shape;
+  // the embedder reads the action and pointer coordinates from it and hands them
+  // to the view's native on_touch callback.
+  static const int _actionDown = 0;
+  static const int _actionUp = 1;
+  static const int _actionMove = 2;
+  static const int _actionCancel = 3;
+
+  static int? _androidAction(PointerEvent event) {
+    if (event is PointerDownEvent) {
+      return _actionDown;
+    }
+    if (event is PointerMoveEvent) {
+      return _actionMove;
+    }
+    if (event is PointerUpEvent) {
+      return _actionUp;
+    }
+    if (event is PointerCancelEvent) {
+      return _actionCancel;
+    }
+    return null; // hover/scroll/etc. — nothing the native view consumes
+  }
+
   @override
   Future<void> dispatchPointerEvent(PointerEvent event) async {
-    // Gesture forwarding to the native view is not wired yet; a video surface
-    // needs none for playback. Left as a no-op until touch routing lands.
+    if (!_created || _disposed) {
+      return;
+    }
+    final action = _androidAction(event);
+    if (action == null) {
+      return;
+    }
+    // One contact, coordinates in view-local logical pixels. The coords row is
+    // the Android PointerCoords layout: x at index 7, y at index 8 (the rest are
+    // orientation/pressure/size/tool/touch axes the video view does not use).
+    final x = event.localPosition.dx;
+    final y = event.localPosition.dy;
+    final params = <Object?>[
+      _viewId, // 0: view id
+      0, // 1: downTime (unused downstream)
+      event.timeStamp.inMilliseconds, // 2: eventTime
+      action, // 3: action
+      1, // 4: pointer count
+      <List<int>>[
+        <int>[0, 1], // 5: pointerProperties: [pointerId, TOOL_TYPE_FINGER]
+      ],
+      <List<double>>[
+        <double>[0, 1, 1, 0, 0, 0, 0, x, y], // 6: pointerCoords (x@7, y@8)
+      ],
+      0, // 7: metaState
+      0, // 8: buttonState
+      1.0, // 9: xPrecision
+      1.0, // 10: yPrecision
+      0, // 11: deviceId
+      0, // 12: edgeFlags
+      0, // 13: source
+      0, // 14: flags
+      0, // 15: motionEventId
+    ];
+    await _channel.invokeMethod<void>('touch', params);
   }
 
   @override

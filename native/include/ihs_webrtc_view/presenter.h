@@ -21,12 +21,14 @@
 #ifndef IHS_WEBRTC_VIEW_PRESENTER_H_
 #define IHS_WEBRTC_VIEW_PRESENTER_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "ihs/platform_view.h"
 #include "lw_video_sink.h"
@@ -60,6 +62,29 @@ class Presenter {
   // Pause/resume presentation when the view leaves/enters the composited scene.
   void set_suspended(bool suspended);
 
+  // Input from the view, delivered by the registry on the platform thread via
+  // IhsPvCallbacks (originating from the Flutter widget's pointer events). The
+  // sequence is queued here and consumed on the present thread, off the
+  // platform thread, so a future consumer that forwards it to the far peer
+  // never stalls the compositor. Coordinates are view-local logical pixels.
+  //
+  // @action / @point_count / @pointer_data mirror the on_touch callback:
+  // @pointer_data is @pointer_data_size doubles, @point_count contacts' coords.
+  void OnTouch(int32_t action, int32_t point_count, size_t pointer_data_size,
+               const double* pointer_data);
+  // Gesture-arena arbitration for a sequence already delivered: the view won
+  // (accept) or lost (reject) the pointer sequence. A consumer forwards a
+  // sequence only once it has been won.
+  void OnAcceptGesture();
+  void OnRejectGesture();
+
+  // Total input samples the present thread has consumed. A
+  // bring-up/observability hook (nothing forwards them yet) and the signal the
+  // unit test checks to know input reached the present thread. Monotonic.
+  uint64_t touches_consumed() const {
+    return touches_consumed_.load(std::memory_order_relaxed);
+  }
+
  private:
   // One frame taken from the decoder, awaiting or undergoing presentation.
   struct Held {
@@ -75,7 +100,16 @@ class Presenter {
   static void OnFormat(const LwDmabufDescriptor* fmt_only, void* user);
   static void OnEos(void* user);
 
-  void PresentLoop();         // present thread body
+  // One pointer/touch sample handed over by the registry, view-local logical
+  // pixels. `coords` is the flat rawPointerCoords the on_touch callback carries
+  // (point_count contacts).
+  struct Touch {
+    int32_t action = 0;
+    int32_t point_count = 0;
+    std::vector<double> coords;
+  };
+  void PresentLoop();                             // present thread body
+  void ConsumeTouches(std::deque<Touch>& batch);  // present thread, lock free
   void Submit(Held&& frame);  // build IhsFrame + ihs_pv_submit
   void Retire(Held& frame);   // wait release fence (bounded) + producer release
   void RetireSignalled();     // retire whatever the compositor has released
@@ -108,6 +142,15 @@ class Presenter {
   bool stop_ = false;
   bool suspended_ = false;
   uint32_t generation_ = 0;  // pool generation of the current format
+
+  // Input queued by OnTouch (platform thread), drained by the present thread.
+  // Bounded: input is advisory, so drop the oldest past the cap rather than let
+  // an absent consumer grow it without bound. `gesture_won_` records the last
+  // arena arbitration (accept/reject) for a future consumer to gate forwarding.
+  static constexpr size_t kTouchQueueCap = 64;
+  std::deque<Touch> touch_;                    // guarded by m_
+  bool gesture_won_ = false;                   // guarded by m_
+  std::atomic<uint64_t> touches_consumed_{0};  // present thread writes
 
   // Playout clock: maps the frames' presentation timestamps (the even capture
   // cadence) to wall-clock due times, so jittery decode delivery is presented

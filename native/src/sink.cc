@@ -111,6 +111,46 @@ void Presenter::set_suspended(bool suspended) {
   suspended_ = suspended;
 }
 
+// ---- input (platform thread): enqueue for the present thread ----
+
+void Presenter::OnTouch(int32_t action, int32_t point_count,
+                        size_t pointer_data_size, const double* pointer_data) {
+  Touch t;
+  t.action = action;
+  t.point_count = point_count;
+  if (pointer_data != nullptr && pointer_data_size > 0) {
+    t.coords.assign(pointer_data, pointer_data + pointer_data_size);
+  }
+  {
+    std::lock_guard<std::mutex> lock(m_);
+    // Advisory input: cap latency/memory by dropping the oldest past the cap.
+    if (touch_.size() >= kTouchQueueCap) {
+      touch_.pop_front();
+    }
+    touch_.push_back(std::move(t));
+  }
+  cv_.notify_all();  // wake the present thread to drain even with no video
+}
+
+void Presenter::OnAcceptGesture() {
+  std::lock_guard<std::mutex> lock(m_);
+  gesture_won_ = true;
+}
+
+void Presenter::OnRejectGesture() {
+  std::lock_guard<std::mutex> lock(m_);
+  gesture_won_ = false;
+}
+
+void Presenter::ConsumeTouches(std::deque<Touch>& batch) {
+  // Called on the present thread with no lock held. This is where a build that
+  // forwards input to the far peer (a data channel / input transport) drains
+  // the sequence; until then the samples are consumed so the queue stays
+  // bounded. gesture_won_ gates whether a consumer should act on them.
+  touches_consumed_.fetch_add(batch.size(), std::memory_order_relaxed);
+  batch.clear();
+}
+
 // ---- LwVideoSinkV1 (decoder delivery thread): non-blocking SPSC handoff ----
 
 int Presenter::OnFrame(const LwDmabufDescriptor* desc, LwFrameRelease release,
@@ -196,7 +236,18 @@ void Presenter::PresentLoop() {
       // its playout due time; a spurious/early wake or a newly-arrived frame
       // just re-evaluates the head.
       for (;;) {
-        cv_.wait(lock, [this] { return !ready_empty() || stop_; });
+        cv_.wait(lock,
+                 [this] { return !ready_empty() || stop_ || !touch_.empty(); });
+        // Drain queued input first, off the platform thread and outside the
+        // lock. A touch-only wake (no frame ready) then falls through to
+        // re-wait rather than touching the frame path below.
+        if (!touch_.empty()) {
+          std::deque<Touch> batch;
+          batch.swap(touch_);
+          lock.unlock();
+          ConsumeTouches(batch);
+          lock.lock();
+        }
         if (stop_) {
           // Move queued frames out, then release outside the lock (release()
           // must not run while m_ is held).
@@ -212,6 +263,10 @@ void Presenter::PresentLoop() {
           }
           DrainInflight();
           return;
+        }
+
+        if (ready_empty()) {
+          continue;  // woken only for input (drained above); nothing to present
         }
 
         const int64_t pts = ready_at(0).desc.rtp_timestamp_us;  // microseconds

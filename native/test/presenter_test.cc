@@ -343,6 +343,7 @@ extern "C" __attribute__((visibility("default"))) const IhsApi* ihs_get_api(
 extern "C" int ihs_webrtc_view_register(const char* view_type);
 extern "C" const LwVideoSinkV1* ihs_webrtc_view_sink_for_view(int32_t view_id,
                                                               void** out_user);
+extern "C" uint64_t ihs_webrtc_view_touch_count(int32_t view_id);
 
 namespace {
 
@@ -402,12 +403,35 @@ PassResult DrivePass(int32_t view_id, uint8_t sync, uint32_t pool_size,
   LwDmabufDescriptor fmt = MakeDescriptor(fds[0], 0);
   sink->on_format(&fmt, sink_user);
 
+  int touches_sent = 0;
   for (int i = 0; i < kFrames; ++i) {
     LwDmabufDescriptor d =
         MakeDescriptor(fds[static_cast<size_t>(i)], static_cast<uint64_t>(i));
     if (sink->on_frame(&d, &ReleaseFrame, &cookies[static_cast<size_t>(i)],
                        sink_user) != 0) {
       ++result.taken;
+    }
+    // Inject pointer input on the platform thread while frames flow, so the
+    // touch queue is drained by the present thread concurrently with the video
+    // path. A single contact, coords in the Android PointerCoords layout (x at
+    // index 7, y at index 8). Gesture-arena arbitration too.
+    if (callbacks.on_touch != nullptr) {
+      const int32_t action =
+          i == 0 ? 0 : (i + 1 == kFrames ? 1 : 2);  // down/move/up
+      const double coords[9] = {0,
+                                1,
+                                1,
+                                0,
+                                0,
+                                0,
+                                0,
+                                static_cast<double>(i),
+                                static_cast<double>(2 * i)};
+      callbacks.on_touch(view_user, action, 1, 9, coords);
+      ++touches_sent;
+    }
+    if (i == 1 && callbacks.accept_gesture != nullptr) {
+      callbacks.accept_gesture(view_user);
     }
     // Feed at the pace the timestamps imply, so frames are presented rather
     // than dropped as late, and sample while the present thread works.
@@ -431,9 +455,25 @@ PassResult DrivePass(int32_t view_id, uint8_t sync, uint32_t pool_size,
       label, result.taken, result.submits, result.released_in_run,
       g_release_ctx_seen.size(), result.max_hold);
 
+  // Input reached the present thread and was drained. The queue cap is far
+  // above the count so none were dropped; poll briefly to avoid racing the
+  // final drain, then require exact delivery.
+  uint64_t consumed = 0;
+  for (int i = 0; i < 100; ++i) {
+    consumed = ihs_webrtc_view_touch_count(view_id);
+    if (consumed >= static_cast<uint64_t>(touches_sent)) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  std::printf("%s: touches_sent=%d consumed=%llu\n", label, touches_sent,
+              static_cast<unsigned long long>(consumed));
+
   CHECK(result.taken > 0);
   CHECK(result.submits > 0);
   CHECK(g_release_before_submit == 0);
+  CHECK(touches_sent > 0);
+  CHECK(consumed == static_cast<uint64_t>(touches_sent));
   // Every release must correspond to a distinct frame: a double release would
   // return the same buffer to the decoder pool twice.
   CHECK(g_release_ctx_seen.size() ==
