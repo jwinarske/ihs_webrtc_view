@@ -85,6 +85,22 @@ static void on_connection_state(int state, void* user) {
   fprintf(stderr, "[peer] connection_state=%d\n", state);
 }
 
+// The "input" data channel this peer opens: the receiver sends the view's
+// pointer JSON here, and this peer -- standing in for a remote host that would
+// act on the input -- just logs it, to show the loop closes.
+static lw_data_channel_t* g_input_dc = NULL;
+static void on_input_state(int state, void* user) {
+  (void)user;
+  fprintf(stderr, "[peer] input channel state=%d\n", state);
+}
+static void on_input_message(char* data, uint32_t size, int binary,
+                             void* user) {
+  (void)user;
+  (void)binary;
+  fprintf(stderr, "[peer] input: %.*s\n", (int)size, data ? data : "");
+  lw_string_free(data);
+}
+
 static void on_fail(char* err, void* user) {
   (void)user;
   fprintf(stderr, "[peer] sdp error: %s\n", err ? err : "?");
@@ -205,6 +221,18 @@ int main(int argc, char** argv) {
   obs.on_ice_candidate = on_ice_candidate;
   obs.on_connection_state = on_connection_state;
   lw_pc_set_observer(g_pc, &obs, NULL);
+
+  // Open the input channel before the offer so it is negotiated in the initial
+  // SDP; the receiver picks it up via on_data_channel and sends pointer JSON.
+  g_input_dc = lw_pc_create_data_channel(g_pc, "input", NULL);
+  if (g_input_dc != NULL) {
+    LwDataChannelObserver dobs;
+    memset(&dobs, 0, sizeof dobs);
+    dobs.size = sizeof dobs;
+    dobs.on_state = on_input_state;
+    dobs.on_message = on_input_message;
+    lw_data_channel_set_observer(g_input_dc, &dobs, NULL);
+  }
 
   lw_video_source_t* source =
       lw_factory_create_video_source(factory, "peer-source");

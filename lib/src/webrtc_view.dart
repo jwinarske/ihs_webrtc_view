@@ -8,6 +8,8 @@
 /// ivi-homescreen registry (DRM plane / dmabuf import / software floor).
 library;
 
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
@@ -29,6 +31,7 @@ class WebRtcView extends StatefulWidget {
     required WebRtcVideoTrack this.track,
     this.hitTestBehavior = PlatformViewHitTestBehavior.opaque,
     this.gestureRecognizers = const <Factory<OneSequenceGestureRecognizer>>{},
+    this.onInput,
   }) : trackId = null;
 
   /// Resolves [trackId] and binds what it finds.
@@ -42,6 +45,7 @@ class WebRtcView extends StatefulWidget {
     required String this.trackId,
     this.hitTestBehavior = PlatformViewHitTestBehavior.opaque,
     this.gestureRecognizers = const <Factory<OneSequenceGestureRecognizer>>{},
+    this.onInput,
   }) : track = null;
 
   /// The decoded video track to bind once the view is created, when given
@@ -52,6 +56,16 @@ class WebRtcView extends StatefulWidget {
   final String? trackId;
   final PlatformViewHitTestBehavior hitTestBehavior;
   final Set<Factory<OneSequenceGestureRecognizer>> gestureRecognizers;
+
+  /// Optional sink for pointer input to forward to the far peer. When set, each
+  /// pointer event on the view is serialized to a small JSON message and handed
+  /// here for the app to send over its own transport (e.g. a WebRTC data
+  /// channel). The message is UTF-8 `{"action":<int>,"pointers":[{"id":<int>,
+  /// "x":<double>,"y":<double>}],"ts":<int-ms>}`, where `action` is
+  /// 0=down/1=up/2=move/3=cancel and coordinates are view-local logical pixels.
+  /// The view has no data channel of its own; forwarding is the app's to wire.
+  /// This is independent of the native on_touch routing the embedder does.
+  final void Function(Uint8List message)? onInput;
 
   @override
   State<WebRtcView> createState() => _WebRtcViewState();
@@ -100,6 +114,7 @@ class _WebRtcViewState extends State<WebRtcView>
           track: widget.track,
           trackId: widget.trackId,
           onCreated: params.onPlatformViewCreated,
+          onInput: widget.onInput,
         );
         controller._create();
         return controller;
@@ -117,10 +132,12 @@ class _WebRtcViewController extends PlatformViewController {
     required WebRtcVideoTrack? track,
     required String? trackId,
     required PlatformViewCreatedCallback onCreated,
+    required void Function(Uint8List message)? onInput,
   })  : _viewId = viewId,
         _given = track,
         _trackId = trackId,
-        _onCreated = onCreated;
+        _onCreated = onCreated,
+        _onInput = onInput;
 
   static const MethodChannel _channel =
       MethodChannel('flutter/platform_views', StandardMethodCodec());
@@ -135,6 +152,7 @@ class _WebRtcViewController extends PlatformViewController {
   final String? _trackId;
   WebRtcVideoTrack? _resolved;
   final PlatformViewCreatedCallback _onCreated;
+  final void Function(Uint8List message)? _onInput;
 
   WebRtcViewBinding? _binding;
   bool _created = false;
@@ -250,6 +268,21 @@ class _WebRtcViewController extends PlatformViewController {
       0, // 15: motionEventId
     ];
     await _channel.invokeMethod<void>('touch', params);
+
+    // Forward the same event to the app's input sink, if any, for the app to
+    // send to the far peer over its own transport. Independent of the native
+    // routing above.
+    final onInput = _onInput;
+    if (onInput != null) {
+      final message = jsonEncode(<String, Object?>{
+        'action': action,
+        'pointers': <Object?>[
+          <String, Object?>{'id': event.pointer, 'x': x, 'y': y},
+        ],
+        'ts': event.timeStamp.inMilliseconds,
+      });
+      onInput(Uint8List.fromList(utf8.encode(message)));
+    }
   }
 
   @override

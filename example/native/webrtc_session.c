@@ -25,6 +25,7 @@ typedef struct {
   lw_factory_t* factory;
   lw_pc_t* pc;
   lw_video_track_t* video_track;  // persistent wrapper; keeps the sink live
+  lw_data_channel_t* input_dc;  // peer's "input" channel; we send pointer JSON
   volatile int ice_state;
   volatile int running;
 } Session;
@@ -67,6 +68,15 @@ static void on_track(lw_transceiver_t* transceiver, void* user) {
   g_s.video_track = vt;  // released in stop()
   if (rx) lw_release((void*)rx);
   lw_release((void*)transceiver);
+}
+// The peer opens an "input" data channel in its offer; keep it so the Dart side
+// can send pointer JSON to the peer over it. Ownership passes to us (released
+// in stop). Set once on the signaling thread, read by webrtc_session_send_input
+// on the UI thread -- a benign single-writer publish for this example.
+static void on_data_channel(lw_data_channel_t* channel, void* user) {
+  (void)user;
+  g_s.input_dc = channel;
+  fprintf(stderr, "[session] data channel opened\n");
 }
 
 // ---- SDP async chain ----
@@ -167,6 +177,7 @@ int webrtc_session_start(const char* host, int port) {
   obs.on_ice_candidate = on_ice_candidate;
   obs.on_ice_connection_state = on_ice_connection_state;
   obs.on_track = on_track;
+  obs.on_data_channel = on_data_channel;
   lw_pc_set_observer(g_s.pc, &obs, NULL);
 
   struct addrinfo hints, *res;
@@ -201,16 +212,29 @@ char* webrtc_session_track_id(void) {
   return g_s.video_track != NULL ? lw_video_track_id(g_s.video_track) : NULL;
 }
 
-uintptr_t webrtc_session_track(void) {
-  return (uintptr_t)g_s.video_track;
-}
+uintptr_t webrtc_session_track(void) { return (uintptr_t)g_s.video_track; }
 
 int webrtc_session_ice_state(void) { return g_s.ice_state; }
+
+// Sends one input message (pointer JSON from the view) to the peer over the
+// "input" data channel, as a binary message. Returns 0 on success, negative if
+// the channel is not open yet or the send is refused. Called from the UI
+// thread.
+int webrtc_session_send_input(const uint8_t* data, int len) {
+  if (g_s.input_dc == NULL || len <= 0) {
+    return -1;
+  }
+  if (lw_data_channel_get_state(g_s.input_dc) != LW_DATA_CHANNEL_OPEN) {
+    return -2;  // not open yet; the app can retry on the next event
+  }
+  return lw_data_channel_send(g_s.input_dc, data, (uint32_t)len, 1);
+}
 
 void webrtc_session_stop(void) {
   if (!g_s.running) return;
   g_s.running = 0;
   pthread_join(g_s.thread, NULL);
+  if (g_s.input_dc) lw_release((void*)g_s.input_dc);
   if (g_s.video_track) lw_release((void*)g_s.video_track);
   lw_pc_remove_observer(g_s.pc);
   lw_pc_close(g_s.pc);
