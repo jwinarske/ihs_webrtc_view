@@ -10,6 +10,7 @@
 // overlay plane on this target).
 import 'dart:async';
 import 'dart:ffi' as ffi;
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter/material.dart';
@@ -27,6 +28,9 @@ class _Session {
         ffi.Pointer<Utf8> Function()>('webrtc_session_track_id');
     _iceState = _lib.lookupFunction<ffi.Int32 Function(), int Function()>(
         'webrtc_session_ice_state');
+    _sendInput = _lib.lookupFunction<
+        ffi.Int32 Function(ffi.Pointer<ffi.Uint8>, ffi.Int32),
+        int Function(ffi.Pointer<ffi.Uint8>, int)>('webrtc_session_send_input');
   }
 
   final ffi.DynamicLibrary _lib;
@@ -34,6 +38,7 @@ class _Session {
   late final int Function() _track;
   late final ffi.Pointer<Utf8> Function() _trackId;
   late final int Function() _iceState;
+  late final int Function(ffi.Pointer<ffi.Uint8>, int) _sendInput;
 
   int start(String host, int port) {
     final h = host.toNativeUtf8();
@@ -59,6 +64,22 @@ class _Session {
   }
 
   int iceState() => _iceState();
+
+  /// Sends one input message to the peer over the data channel. Best-effort:
+  /// drops it (returns) while the channel is not open yet. Copies into native
+  /// memory for the duration of the call.
+  void sendInput(Uint8List message) {
+    if (message.isEmpty) {
+      return;
+    }
+    final buf = malloc<ffi.Uint8>(message.length);
+    buf.asTypedList(message.length).setAll(0, message);
+    try {
+      _sendInput(buf, message.length);
+    } finally {
+      malloc.free(buf);
+    }
+  }
 }
 
 // The x86 aiortc peer's framed-TCP signaling endpoint. Override via
@@ -142,7 +163,8 @@ class _VideoPageState extends State<VideoPage> {
           if (trackId != null)
             // Resolved by id: the same route a consumer takes when another
             // plugin owns the peer connection and only surfaces the id.
-            WebRtcView.byTrackId(trackId: trackId)
+            // onInput forwards pointer events to the peer over the data channel.
+            WebRtcView.byTrackId(trackId: trackId, onInput: _session.sendInput)
           else
             Center(
               child: Text(

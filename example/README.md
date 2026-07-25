@@ -43,6 +43,23 @@ The signalling is a framed TCP socket: `OFFER <len>\n<sdp>`,
 `ANSWER <len>\n<sdp>`, `CAND <mline> <len>\n<candidate>`. Any peer speaking
 that and offering H.264 will do.
 
+## Pointer input (the reverse path)
+
+The peer's offer also opens an `input` WebRTC data channel. The app passes
+`WebRtcView.byTrackId(onInput: session.sendInput)`, so each pointer event on the
+view is serialised to a small JSON message
+(`{"action","pointers":[{"id","x","y"}],"ts"}`, coordinates in view-local
+logical pixels) and sent to the peer over that channel; `webrtc_session_send_input`
+in `webrtc_session.c` does the send. `h264_peer.c` stands in for a remote host
+that would act on the input — it just logs each message (`[peer] input: ...`),
+which is how you confirm the loop closes: touch the video and the peer's stderr
+scrolls pointer JSON.
+
+This is a demonstration transport, not a projection protocol; a real target
+(Android Auto / CarPlay input, a remote-desktop host) defines its own wire
+format and consumer. It is also independent of the platform view's native
+`on_touch` routing — that path stays available for a native input consumer.
+
 `SIGNALING_HOST`/`SIGNALING_PORT` are compile-time
 (`String.fromEnvironment`), so they are baked when the assets are built:
 
