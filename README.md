@@ -29,9 +29,9 @@ keeps the headless (no-presenter) path and the service-bundle shape intact.
 
 The presenter states what it can accept and the registry grants one of them;
 it does not resolve a presentation path itself. At view creation it asks for a
-DRM plane or the software floor, linear NV12, below Flutter, preferring
-explicit sync. Requesting the floor guarantees a grant, so there is always a
-path. `submit` is uniform across kinds, so nothing is rewired per kind.
+DRM plane or the software floor, linear NV12 or SAND128 columns, below
+Flutter, preferring explicit sync. Requesting the floor guarantees a grant, so
+there is always a path. `submit` is uniform across kinds, so nothing is rewired per kind.
 
 The grant's sync mode is what matters downstream, because it decides how the
 presenter releases buffers:

@@ -123,6 +123,9 @@ void FakeUnregisterFactory(const char* /*view_type*/) { g_factory = nullptr; }
 // offers both, and every backend offers the software floor.
 uint32_t g_offered_kinds = IHS_PV_KIND_TEXTURE_DMABUF_IMPORT;
 uint32_t g_last_requested_kinds = 0;
+// The formats of the last request, copied: the request's array is the
+// plugin's.
+std::vector<IhsFormatModifier> g_last_requested_formats;
 
 int FakeNegotiate(IhsPlatformView* /*view*/,
                   const IhsPvRequirements* requirements, IhsPvGrant* out) {
@@ -130,6 +133,9 @@ int FakeNegotiate(IhsPlatformView* /*view*/,
     return IHS_PV_ERR_INVALID;
   }
   g_last_requested_kinds = requirements->kinds;
+  g_last_requested_formats.assign(
+      requirements->formats,
+      requirements->formats + requirements->format_count);
   // Grant only what was asked for. Granting a kind the plugin never requested
   // hides exactly the mismatch this is here to catch: a plugin that asks for a
   // plane on a backend that offers only import must not silently work.
@@ -775,6 +781,22 @@ int main() {
   // omits it drops to a copy per frame.
   CHECK((g_last_requested_kinds & IHS_PV_KIND_TEXTURE_DMABUF_IMPORT) != 0);
   CHECK((g_last_requested_kinds & IHS_PV_KIND_SOFTWARE_SHM) != 0);
+
+  // The request names every layout a frame may be submitted in. Linear NV12
+  // comes first, so it is what is granted where the backend takes it; the
+  // Pi 5 HEVC decoder's SAND128 column layouts follow, 8-bit and 10-bit.
+  constexpr uint64_t kSand128 = (0x07ULL << 56) | 4;
+  constexpr uint32_t kNv12 = 0x3231564e;  // 'NV12'
+  constexpr uint32_t kP030 = 0x30333050;  // 'P030'
+  CHECK(g_last_requested_formats.size() == 3);
+  if (g_last_requested_formats.size() == 3) {
+    CHECK(g_last_requested_formats[0].fourcc == kNv12);
+    CHECK(g_last_requested_formats[0].modifier == 0);
+    CHECK(g_last_requested_formats[1].fourcc == kNv12);
+    CHECK(g_last_requested_formats[1].modifier == kSand128);
+    CHECK(g_last_requested_formats[2].fourcc == kP030);
+    CHECK(g_last_requested_formats[2].modifier == kSand128);
+  }
 
   // buffer_id must name the buffer rather than the frame.
   DriveRingReuse(12);

@@ -35,12 +35,26 @@ uint32_t Fourcc(char a, char b, char c, char d) {
          (static_cast<uint32_t>(static_cast<unsigned char>(d)) << 24);
 }
 
-// The format we request: linear NV12 (DRM_FORMAT_MOD_LINEAR == 0). The decoder
-// emits linear NV12, which a vc4 overlay plane scans out directly and the
-// software floor reads correctly. (The Pi's native decoder can also produce
-// SAND-tiled NV12 via DRM_FORMAT_MOD_BROADCOM_SAND128; that path is not used
-// here, so the modifier is left linear to match what is actually produced.)
-const IhsFormatModifier kNv12Linear = {Fourcc('N', 'V', '1', '2'), 0, 0};
+// DRM_FORMAT_MOD_BROADCOM_SAND128 with no column height in it: the height is
+// in each plane's pitch, which is how the decoder describes a frame whose luma
+// and chroma are in separate buffers. Spelled out because this file includes
+// no DRM header.
+constexpr uint64_t kModBroadcomSand128 = (0x07ULL << 56) | 4;
+
+// The layouts the decoder can hand over, and so the ones a frame may be
+// submitted in (Presenter::Submit passes each frame's own fourcc and modifier
+// on). Linear NV12 first: most decoders produce it, a vc4 overlay plane scans
+// it out directly and the software floor reads it, so it is the one to be
+// granted where the backend takes it. A Pi 5's HEVC decoder has no linear
+// output: its frames are SAND128 columns, NV12 for 8-bit and P030 for 10-bit.
+// Asking for linear alone told the registry something the frames then
+// contradicted.
+const IhsFormatModifier kFormats[] = {
+    {Fourcc('N', 'V', '1', '2'), 0, 0},
+    {Fourcc('N', 'V', '1', '2'), 0, kModBroadcomSand128},
+    {Fourcc('P', '0', '3', '0'), 0, kModBroadcomSand128},
+};
+constexpr size_t kFormatCount = sizeof(kFormats) / sizeof(kFormats[0]);
 
 // ---- ihs_shared resolution (once) ----
 
@@ -155,8 +169,8 @@ void OnRenegotiate(void* user_data) {
   // is the one outcome the whole path exists to avoid.
   req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_TEXTURE_DMABUF_IMPORT |
               IHS_PV_KIND_SOFTWARE_SHM;
-  req.formats = &kNv12Linear;
-  req.format_count = 1;
+  req.formats = kFormats;
+  req.format_count = kFormatCount;
   req.sync =
       IHS_PV_SYNC_EXPLICIT_PREFERRED;  // get a release fence -> no tearing
   req.z_order = IHS_PV_Z_BELOW_FLUTTER;
@@ -184,8 +198,8 @@ int Factory(const IhsPvCreateInfo* info, void* /*factory_user*/,
   // is the one outcome the whole path exists to avoid.
   req.kinds = IHS_PV_KIND_DRM_PLANE | IHS_PV_KIND_TEXTURE_DMABUF_IMPORT |
               IHS_PV_KIND_SOFTWARE_SHM;
-  req.formats = &kNv12Linear;
-  req.format_count = 1;
+  req.formats = kFormats;
+  req.format_count = kFormatCount;
   req.needs_alpha = 0;
   req.sync =
       IHS_PV_SYNC_EXPLICIT_PREFERRED;  // get a release fence -> no tearing
